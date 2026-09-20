@@ -19,8 +19,8 @@ use super::geometry::{
     scaled_run_geometry,
 };
 use super::word_gaps::{
-    offset_takes_spacing_back, word_gap_candidate, word_gap_threshold, PendingWordGaps,
-    WordGapCandidate,
+    offset_takes_spacing_back, tj_gap_thresholds, tj_tracking, word_gap_candidate,
+    word_gap_threshold, PendingWordGaps, WordGapCandidate,
 };
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
@@ -948,7 +948,37 @@ fn extract_form_xobject_text_inner(
                         // Word-space threshold for `TJ` offsets and character
                         // spacing alike, from the font metrics when available.
                         let space_threshold = word_gap_threshold(font_info);
-                        let column_gap_threshold = space_threshold * 4.0;
+                        // A tracked display run is judged over its own
+                        // tracking, as on the page (see `tj_tracking` and
+                        // `tj_gap_thresholds`); a hidden run is not read
+                        // for it, and the reader decodes the glyphs of a run
+                        // in the tracking band on a copy of the CMap
+                        // decisions.
+                        let tracking = if hidden {
+                            None
+                        } else {
+                            let mut probe_decisions: Option<CMapDecisionCache> = None;
+                            tj_tracking(array, font_info, space_threshold, |element| {
+                                extract_text_from_operand(
+                                    element,
+                                    &current_font,
+                                    font_base_names.get(&current_font).map(|s| s.as_str()),
+                                    font_cmaps,
+                                    &font_tounicode_refs,
+                                    &inline_cmaps,
+                                    &font_encodings,
+                                    &encoding_cache,
+                                    probe_decisions.get_or_insert_with(|| cmap_decisions.clone()),
+                                    &font_widths,
+                                )
+                            })
+                        };
+                        let baseline_horizontal = {
+                            let combined = multiply_matrices(&text_matrix, &ctm);
+                            combined[0].abs() >= combined[1].abs()
+                        };
+                        let (word_gap, split_gap) =
+                            tj_gap_thresholds(space_threshold, tracking, baseline_horizontal);
 
                         let mut sub_items: Vec<(String, f32, f32, f32, bool)> = Vec::new();
                         let mut current_text = String::new();
@@ -988,10 +1018,7 @@ fn extract_form_xobject_text_inner(
                                     {
                                         backward_jump = true;
                                     }
-                                    if !hidden
-                                        && n_val < -column_gap_threshold
-                                        && !current_text.is_empty()
-                                    {
+                                    if !hidden && n_val < -split_gap && !current_text.is_empty() {
                                         sub_items.push((
                                             std::mem::take(&mut current_text),
                                             sub_start_width_ts,
@@ -1005,7 +1032,7 @@ fn extract_form_xobject_text_inner(
                                     } else {
                                         total_width_ts += displacement;
                                         if !hidden
-                                            && n_val < -space_threshold
+                                            && n_val < -word_gap
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
                                         {
@@ -1026,10 +1053,7 @@ fn extract_form_xobject_text_inner(
                                     {
                                         backward_jump = true;
                                     }
-                                    if !hidden
-                                        && n_val < -column_gap_threshold
-                                        && !current_text.is_empty()
-                                    {
+                                    if !hidden && n_val < -split_gap && !current_text.is_empty() {
                                         sub_items.push((
                                             std::mem::take(&mut current_text),
                                             sub_start_width_ts,
@@ -1043,7 +1067,7 @@ fn extract_form_xobject_text_inner(
                                     } else {
                                         total_width_ts += displacement;
                                         if !hidden
-                                            && n_val < -space_threshold
+                                            && n_val < -word_gap
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
                                         {
@@ -2429,5 +2453,31 @@ BT /F1 10 Tf 0 1 -1 0 60 200 Tm [(ABCD)] TJ ET",
         .unwrap();
         let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
         assert_eq!(texts, ["dto", "dto"], "{items:?}");
+    }
+
+    /// Tracked display text set as a glyph-per-string `TJ` array inside a
+    /// form is judged over its own tracking, as on the page; positioning
+    /// between whole words reads as before. The form font's space is 0.6
+    /// em, so its word-gap threshold is 240 thousandths.
+    #[test]
+    fn tracked_tj_title_inside_form_stays_one_word() {
+        for (content, expected) in [
+            (
+                "BT /F1 24 Tf 72 700 Td [(V) -216 (A) -333 (L) -166 (L) -250 (E) -290 (Y)] TJ ET",
+                "VALLEY",
+            ),
+            (
+                "BT /F1 24 Tf 72 700 Td [(V) -250 (A) -250 (L) -250 (L) -250 (E) -250 (Y) -560 (R) -250 (O) -250 (A) -250 (D)] TJ ET",
+                "VALLEY ROAD",
+            ),
+            (
+                "BT /F1 12 Tf 72 700 Td [(The) -258 (quick) -300 (brown)] TJ ET",
+                "The quick brown",
+            ),
+        ] {
+            let items = form_items(content.as_bytes());
+            let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(texts.join(" "), expected, "{content}: {items:?}");
+        }
     }
 }

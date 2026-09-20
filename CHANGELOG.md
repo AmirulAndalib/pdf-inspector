@@ -30,6 +30,17 @@ Changes since 1.21.0.
   code points that a font subsetted by glyph maps its glyphs to — are
   normalized to the letters they stand for once the text is in reading
   order, so a ligature's letters come out in order too.
+- Tracked display text set as a `TJ` array with one glyph per string and
+  the letter spacing as the offset between them (`[(V) -250 (A) -250 (L) …]
+  TJ`) came out with a space between every letter. The offsets of such a
+  run are now judged over the run's own tracking, so letter gaps stay
+  inside the word and only a gap wider by a word space ends it. Words
+  positioned by offsets and kerned glyph runs read as before, on the page
+  and inside Form XObjects; so do one-letter words half a space width apart
+  or more, except a run of single capitals or digits set that wide, which
+  display tracking produces and which now reads as one word, as the merge
+  of separately shown glyphs already had it.
+  ([#548](https://github.com/firecrawl/pdf-inspector/pull/548))
 
 ## [1.21.0] - 2026-09-18
 
