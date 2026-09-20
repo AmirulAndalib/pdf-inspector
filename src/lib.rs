@@ -4226,14 +4226,17 @@ fn finish_loaded_document(mut doc: Document) -> Result<(Document, u32, LoadRepai
 }
 
 /// Per-stream decompression budget applied while loading (object streams and
-/// xref streams). Some tagged PDFs pack their structure tree into object
+/// xref streams), and the bound within which the detector reads a font's
+/// ToUnicode CMap (`detector::font_decoder`): a CMap stream costs no more
+/// than a stream the loader materializes, and changing either bound means
+/// changing both. Some tagged PDFs pack their structure tree into object
 /// streams that inflate to hundreds of MB each from a ~20MB file; lopdf
 /// materializes every object stream eagerly at load, so without a bound one
 /// such document exhausts memory before any of our code runs. lopdf skips an
 /// object stream that would exceed the bound (its objects resolve as
 /// not-found), which the zero-page check in `load_document_from_mem_with_password`
 /// turns into a load error instead of a silently wrong answer.
-const MAX_STREAM_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_STREAM_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
 
 fn bounded_load_options() -> lopdf::LoadOptions {
     lopdf::LoadOptions {
