@@ -1,7 +1,7 @@
 //! Font width parsing, encoding, and text decoding.
 
 use super::get_number;
-use crate::glyph_names::glyph_to_char;
+use crate::glyph_names::glyph_name_to_string;
 use crate::tounicode::FontCMaps;
 use crate::types::{
     BaseEncoding, BoldSource, FontEncoding, FontEncodingMap, FontWidthInfo, PageFontEncodings,
@@ -98,6 +98,7 @@ pub(crate) fn resolve_dict<'a>(
 pub(crate) fn build_font_widths(
     doc: &Document,
     fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+    font_cache: &mut FontStyleCache,
 ) -> PageFontWidths {
     let mut widths = PageFontWidths::new();
 
@@ -134,7 +135,7 @@ pub(crate) fn build_font_widths(
             resource_name, subtype, base_font, has_tounicode, encoding_str, has_descendants
         );
 
-        if let Some(info) = parse_font_widths(doc, font_dict) {
+        if let Some(info) = parse_font_widths(doc, font_dict, font_cache) {
             widths.insert(resource_name, info);
         }
     }
@@ -293,6 +294,7 @@ pub(crate) fn item_font_name<'a>(resource_name: &'a str, base_font: &'a str) -> 
 pub(crate) fn parse_font_widths(
     doc: &Document,
     font_dict: &lopdf::Dictionary,
+    font_cache: &mut FontStyleCache,
 ) -> Option<FontWidthInfo> {
     // Get the font subtype
     let subtype = font_dict.get(b"Subtype").ok()?;
@@ -301,7 +303,7 @@ pub(crate) fn parse_font_widths(
     match subtype_name {
         b"Type0" => parse_type0_widths(doc, font_dict),
         b"Type1" | b"TrueType" | b"MMType1" => parse_simple_font_widths(doc, font_dict)
-            .or_else(|| base14_fallback_widths(doc, font_dict)),
+            .or_else(|| base14_fallback_widths(doc, font_dict, font_cache)),
         b"Type3" => parse_simple_font_widths(doc, font_dict),
         _ => None,
     }
@@ -316,8 +318,13 @@ pub(crate) fn parse_font_widths(
 /// Widths are resolved per code through the font's Differences encoding when
 /// present, falling back to the same single-byte decode the text extractor
 /// uses (cp1252-style smart punctuation for 0x80..=0x9F, Latin-1 elsewhere) —
-/// so the width of a code always matches the char we extract for it.
-fn base14_fallback_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Option<FontWidthInfo> {
+/// so the width of a code always matches the char we extract for it. The
+/// cache keeps an embedded program shared across pages parsed once.
+fn base14_fallback_widths(
+    doc: &Document,
+    font_dict: &lopdf::Dictionary,
+    font_cache: &mut FontStyleCache,
+) -> Option<FontWidthInfo> {
     let base_font = font_dict
         .get(b"BaseFont")
         .ok()
@@ -336,10 +343,37 @@ fn base14_fallback_widths(doc: &Document, font_dict: &lopdf::Dictionary) -> Opti
         .as_ref()
         .map(|r| r.named_codes.clone())
         .unwrap_or_default();
-    let enc_map = encoding.map(|r| r.map).unwrap_or_default();
+    let mut sequences = encoding
+        .as_ref()
+        .map(|r| r.sequences.clone())
+        .unwrap_or_default();
+    let mut enc_map = encoding.as_ref().map(|r| r.map.clone()).unwrap_or_default();
+    // A numbered name (`g12`) reads through the embedded program for the
+    // decoder (`build_font_encodings`); its code is as wide as that reading.
+    if let Some(result) = &encoding {
+        let by_index = glyph_index_chars(doc, font_dict, &result.gid_names, font_cache);
+        merge_program_readings(by_index, &mut enc_map, &mut sequences);
+    }
 
     let mut widths = HashMap::new();
     for code in 0u16..=255 {
+        // A ligature named by its components is as wide as its letters —
+        // where a Differences character does not take the code first, as
+        // in the decoder; a letter without a width counts the default, and
+        // the sum of an absurdly long name saturates instead of wrapping.
+        if let Some(text) = sequences
+            .get(&(code as u8))
+            .filter(|_| !enc_map.contains_key(&(code as u8)))
+        {
+            let total = text
+                .chars()
+                .map(|ch| {
+                    crate::extractor::base14::base14_char_width(&base_font, ch).unwrap_or(500)
+                })
+                .fold(0u16, u16::saturating_add);
+            widths.insert(code, total);
+            continue;
+        }
         // Resolution order: Differences override, then the font's base
         // encoding — the dictionary's `/BaseEncoding`, or the BUILT-IN
         // encoding of Symbol/ZapfDingbats when no named encoding replaces
@@ -791,6 +825,7 @@ pub(crate) fn build_font_encodings(
         let mut identity_overrides = FontEncodingMap::new();
         let mut base: Option<BaseEncoding> = None;
         let mut named_codes = std::collections::HashSet::new();
+        let mut sequences: HashMap<u8, String> = HashMap::new();
         // A Type3 font's Differences name its glyph procedures: a numbered
         // name there (`g10`) labels a procedure and indexes nothing, so the
         // glyph-index reading below is for fonts with a glyph table only.
@@ -802,11 +837,12 @@ pub(crate) fn build_font_encodings(
         if let Some(result) = parse_font_encoding(doc, font_dict) {
             base = result.base;
             named_codes = result.named_codes.clone();
+            sequences = result.sequences.clone();
             // Names that are glyph indexes (`g12`, `glyph12`, `index12`)
             // say nothing by themselves; the embedded font program says
             // what those glyphs are.
             let by_index = if type3 {
-                FontEncodingMap::new()
+                HashMap::new()
             } else {
                 glyph_index_chars(doc, font_dict, &result.gid_names, font_cache)
             };
@@ -827,9 +863,7 @@ pub(crate) fn build_font_encodings(
                 identity_overrides = stale_identity_cmap_overrides(doc, font_dict, cmaps, &result);
                 differences = result.map;
             }
-            for (code, ch) in by_index {
-                differences.entry(code).or_insert(ch);
-            }
+            merge_program_readings(by_index, &mut differences, &mut sequences);
         }
         // Symbol and ZapfDingbats read through their built-in encodings
         // unless the font names another encoding outright.
@@ -837,7 +871,17 @@ pub(crate) fn build_font_encodings(
             base = builtin_base_encoding(doc, font_dict);
         }
         let blank_codes = blank_glyph_codes(doc, font_dict, font_cache);
-        if !differences.is_empty() || !blank_codes.is_empty() || base.is_some() {
+        // A font whose Differences name only codes nothing here can read
+        // gets no encoding, on purpose: the fallback then reads its codes
+        // as the single-byte characters they are, which such producers
+        // tend to keep meaningful (a glyph named by the character itself,
+        // `=` or `;`), where an encoding would read them as nothing. Only
+        // a font some of whose names do read treats the rest as nothing.
+        if !differences.is_empty()
+            || !sequences.is_empty()
+            || !blank_codes.is_empty()
+            || base.is_some()
+        {
             encodings.insert(
                 resource_name,
                 FontEncoding {
@@ -846,6 +890,7 @@ pub(crate) fn build_font_encodings(
                     blank_codes,
                     base,
                     named_codes,
+                    sequences,
                 },
             );
         }
@@ -898,14 +943,41 @@ fn builtin_base_encoding(doc: &Document, font_dict: &lopdf::Dictionary) -> Optio
 /// program does not identify are left out. What each name resolves to is
 /// kept in `font_cache` per program, so a font shared across pages is
 /// parsed once.
+/// Merge the font program's readings of a font's numbered glyph names
+/// ([`glyph_index_chars`]) into its encoding the way
+/// `parse_encoding_dictionary` records a name's own reading: a reading of
+/// one character joins the Differences and a longer one the sequences,
+/// each removing the code from the other map first. The names are the
+/// last names of their codes, so their readings stand.
+fn merge_program_readings(
+    by_index: HashMap<u8, String>,
+    differences: &mut FontEncodingMap,
+    sequences: &mut HashMap<u8, String>,
+) {
+    for (code, text) in by_index {
+        let mut chars = text.chars();
+        match (chars.next(), chars.next()) {
+            (Some(ch), None) => {
+                sequences.remove(&code);
+                differences.insert(code, ch);
+            }
+            (Some(_), Some(_)) => {
+                differences.remove(&code);
+                sequences.insert(code, text);
+            }
+            (None, _) => {}
+        }
+    }
+}
+
 fn glyph_index_chars(
     doc: &Document,
     font_dict: &lopdf::Dictionary,
     names: &[(u8, String)],
     font_cache: &mut FontStyleCache,
-) -> FontEncodingMap {
+) -> HashMap<u8, String> {
     if names.is_empty() {
-        return FontEncodingMap::new();
+        return HashMap::new();
     }
     let font_file = || -> Option<ObjectId> {
         let descriptor = resolve_dict(doc, font_dict.get(b"FontDescriptor").ok()?)?;
@@ -914,7 +986,7 @@ fn glyph_index_chars(
             .find_map(|key| descriptor.get(key).ok()?.as_reference().ok())
     };
     let Some(ff_ref) = font_file() else {
-        return FontEncodingMap::new();
+        return HashMap::new();
     };
     let cached = font_cache
         .numbered_glyphs_by_font_file
@@ -930,12 +1002,12 @@ fn glyph_index_chars(
             .map(|data| resolve_numbered_glyph_names(&data, &unresolved))
             .unwrap_or_default();
         for name in unresolved {
-            cached.insert(name.to_string(), resolved.get(name).copied().flatten());
+            cached.insert(name.to_string(), resolved.get(name).cloned().flatten());
         }
     }
     names
         .iter()
-        .filter_map(|(code, name)| Some((*code, (*cached.get(name)?)?)))
+        .filter_map(|(code, name)| Some((*code, cached.get(name)?.clone()?)))
         .collect()
 }
 
@@ -944,14 +1016,25 @@ fn glyph_index_chars(
 /// a glyph the program does not identify. A stream holding a TrueType
 /// collection is read face by face: a glyph the program names, or a CID
 /// it maps, may sit in any member, while a bare index reads in the first.
-fn resolve_numbered_glyph_names(data: &[u8], names: &[&str]) -> HashMap<String, Option<char>> {
-    /// One face of the stream with its glyph → character map.
+fn resolve_numbered_glyph_names(data: &[u8], names: &[&str]) -> HashMap<String, Option<String>> {
+    /// One face of the stream with its cmap's characters; what a glyph
+    /// reads as is looked up for the glyph a name asks for, not for every
+    /// glyph of the font.
     struct Program<'a> {
         face: Option<ttf_parser::Face<'a>>,
         bare_cff: Option<ttf_parser::cff::Table<'a>>,
-        by_glyph: HashMap<u16, char>,
+        cmap_chars: HashMap<u16, char>,
     }
     impl Program<'_> {
+        fn text(&self, gid: u16) -> Option<String> {
+            match (&self.face, &self.bare_cff) {
+                (Some(face), _) => crate::tounicode::glyph_text(face, &self.cmap_chars, gid),
+                (None, Some(cff)) => {
+                    glyph_name_to_string(cff.glyph_name(ttf_parser::GlyphId(gid))?)
+                }
+                (None, None) => None,
+            }
+        }
         fn cff(&self) -> Option<&ttf_parser::cff::Table<'_>> {
             self.face
                 .as_ref()
@@ -975,7 +1058,7 @@ fn resolve_numbered_glyph_names(data: &[u8], names: &[&str]) -> HashMap<String, 
     let mut programs: Vec<Program> = (0..ttf_parser::fonts_in_collection(data).unwrap_or(1))
         .filter_map(|index| ttf_parser::Face::parse(data, index).ok())
         .map(|face| Program {
-            by_glyph: crate::tounicode::build_gid_to_unicode(&face).unwrap_or_default(),
+            cmap_chars: crate::tounicode::cmap_glyph_chars(&face),
             face: Some(face),
             bare_cff: None,
         })
@@ -983,12 +1066,7 @@ fn resolve_numbered_glyph_names(data: &[u8], names: &[&str]) -> HashMap<String, 
     if programs.is_empty() {
         if let Some(cff) = ttf_parser::cff::Table::parse(data) {
             programs.push(Program {
-                by_glyph: (0..cff.number_of_glyphs())
-                    .filter_map(|gid| {
-                        let name = cff.glyph_name(ttf_parser::GlyphId(gid))?;
-                        glyph_to_char(name).map(|ch| (gid, ch))
-                    })
-                    .collect(),
+                cmap_chars: HashMap::new(),
                 face: None,
                 bare_cff: Some(cff),
             });
@@ -997,25 +1075,25 @@ fn resolve_numbered_glyph_names(data: &[u8], names: &[&str]) -> HashMap<String, 
     let Some(first) = programs.first() else {
         return HashMap::new();
     };
-    let resolve = |name: &str| -> Option<char> {
+    let resolve = |name: &str| -> Option<String> {
         // A glyph the program names that way is the glyph meant, whatever
         // character it has.
         if let Some((program, gid)) = programs
             .iter()
             .find_map(|program| program.glyph_by_name(name).map(|gid| (program, gid)))
         {
-            return program.by_glyph.get(&gid).copied();
+            return program.text(gid);
         }
         match numbered_glyph_name(name)? {
-            NumberedGlyph::Index(index) => first.by_glyph.get(&index).copied(),
+            NumberedGlyph::Index(index) => first.text(index),
             NumberedGlyph::Cid(cid) => {
                 if let Some((program, gid)) = programs
                     .iter()
                     .find_map(|program| program.glyph_by_cid(cid).map(|gid| (program, gid)))
                 {
-                    return program.by_glyph.get(&gid).copied();
+                    return program.text(gid);
                 }
-                first.by_glyph.get(&cid).copied()
+                first.text(cid)
             }
         }
     };
@@ -1387,6 +1465,9 @@ pub(crate) struct EncodingResult {
     pub gid_names: Vec<(u8, String)>,
     /// Every code the `/Differences` array names, mapped or not.
     pub named_codes: std::collections::HashSet<u8>,
+    /// Codes whose glyph stands for several characters (see
+    /// [`FontEncoding::sequences`]).
+    pub sequences: HashMap<u8, String>,
     /// The `/BaseEncoding`, when the dictionary names one.
     pub base: Option<BaseEncoding>,
 }
@@ -1453,6 +1534,7 @@ pub(crate) fn parse_encoding_dictionary(
     let mut gid_codes: Vec<u8> = Vec::new();
     let mut gid_names: Vec<(u8, String)> = Vec::new();
     let mut named_codes = std::collections::HashSet::new();
+    let mut sequences: HashMap<u8, String> = HashMap::new();
 
     for item in diff_array {
         match item {
@@ -1464,23 +1546,46 @@ pub(crate) fn parse_encoding_dictionary(
                 // Map current code to glyph name -> Unicode
                 let glyph_name = String::from_utf8_lossy(&name).to_string();
                 named_codes.insert(current_code);
-                let mapped_char = glyph_to_char(&glyph_name)
-                    .or_else(|| private_glyph_to_char(&glyph_name, base_font_name));
-                if mapped_char.is_some_and(is_ligature_char) {
+                // What the name stands for: one character, or the letters
+                // of a ligature named by its components (`f_t`) or by a
+                // `uni` sequence.
+                let mapped = glyph_name_to_string(&glyph_name).or_else(|| {
+                    private_glyph_to_char(&glyph_name, base_font_name).map(String::from)
+                });
+                let mut chars = mapped.as_deref().unwrap_or_default().chars();
+                let mapped_char = match (chars.next(), chars.next()) {
+                    (Some(ch), None) => Some(ch),
+                    _ => None,
+                };
+                if mapped_char.is_some_and(is_ligature_char)
+                    || mapped.as_ref().is_some_and(|text| text.chars().count() > 1)
+                {
                     debug!(
                         "  Differences: code=0x{:02X} glyph={:?} (ligature)",
                         current_code, glyph_name
                     );
                     ligature_count += 1;
                 }
+                // A code named twice keeps its last name, in one map only:
+                // whatever an earlier name gave the code — a character, the
+                // letters of a ligature, or a numbered name awaiting the
+                // font program — goes when a later name takes the code.
+                encoding_map.remove(&current_code);
+                sequences.remove(&current_code);
+                glyph_names.remove(&current_code);
+                gid_codes.retain(|code| *code != current_code);
+                gid_names.retain(|(code, _)| *code != current_code);
                 // Numbered names (e.g. "gid00053", "g53", "cid53") say
                 // nothing without the font program's glyph table.
-                if mapped_char.is_none() && numbered_glyph_name(&glyph_name).is_some() {
+                if mapped.is_none() && numbered_glyph_name(&glyph_name).is_some() {
                     gid_codes.push(current_code);
                     gid_names.push((current_code, glyph_name.clone()));
                 }
                 if let Some(ch) = mapped_char {
                     encoding_map.insert(current_code, ch);
+                    glyph_names.insert(current_code, glyph_name);
+                } else if let Some(text) = mapped {
+                    sequences.insert(current_code, text);
                     glyph_names.insert(current_code, glyph_name);
                 } else {
                     debug!(
@@ -1497,7 +1602,7 @@ pub(crate) fn parse_encoding_dictionary(
     if ligature_count > 0 {
         debug!(
             "  Differences: {} total entries, {} ligatures",
-            encoding_map.len(),
+            encoding_map.len() + sequences.len(),
             ligature_count
         );
     }
@@ -1515,6 +1620,7 @@ pub(crate) fn parse_encoding_dictionary(
         gid_codes,
         gid_names,
         named_codes,
+        sequences,
         base,
     })
 }
@@ -1624,7 +1730,7 @@ pub(crate) struct FontStyleCache {
     /// embedded font program (see `glyph_index_chars`), `None` when the
     /// program does not identify it, so a font shared across pages is
     /// parsed once.
-    numbered_glyphs_by_font_file: HashMap<ObjectId, HashMap<String, Option<char>>>,
+    numbered_glyphs_by_font_file: HashMap<ObjectId, HashMap<String, Option<String>>>,
 }
 
 impl FontStyleCache {
@@ -1966,6 +2072,14 @@ pub(crate) fn extract_text_from_operand(
                                     {
                                         return Some(ch.to_string());
                                     }
+                                    // A CMap that maps a code to itself says
+                                    // nothing a Differences ligature name at
+                                    // that code does not say better.
+                                    if let Some(text) =
+                                        encoding_map.and_then(|map| map.sequences.get(&b))
+                                    {
+                                        return Some(text.clone());
+                                    }
                                 }
                                 return Some(s);
                             }
@@ -1980,6 +2094,9 @@ pub(crate) fn extract_text_from_operand(
                         if let Some(map) = encoding_map {
                             if let Some(&ch) = map.differences.get(&b) {
                                 return Some(ch.to_string());
+                            }
+                            if let Some(text) = map.sequences.get(&b) {
+                                return Some(text.clone());
                             }
                         }
                         // A code the Differences name but could not map is
@@ -2141,6 +2258,7 @@ pub(crate) fn extract_text_from_operand(
                 let has_diff_match = encoding.base.is_some()
                     || bytes.iter().any(|b| {
                         encoding_map.contains_key(b)
+                            || encoding.sequences.contains_key(b)
                             || encoding.blank_codes.contains(b)
                             || encoding.named_codes.contains(b)
                     });
@@ -2148,30 +2266,32 @@ pub(crate) fn extract_text_from_operand(
                     let decoded: String = bytes
                         .iter()
                         .filter_map(|&b| {
-                            let label = if let Some(&ch) = encoding_map.get(&b) {
-                                Some(ch)
+                            let label: String = if let Some(&ch) = encoding_map.get(&b) {
+                                ch.to_string()
+                            } else if let Some(text) = encoding.sequences.get(&b) {
+                                text.clone()
                             } else if encoding.named_codes.contains(&b) {
                                 // A named glyph that could not be mapped:
                                 // nothing else stands in for it.
-                                None
+                                return None;
                             } else if let Some(ch) = encoding
                                 .base
                                 .filter(|_| b >= 0x20)
                                 .and_then(|base| base.char_for(b))
                             {
-                                Some(ch)
+                                ch.to_string()
                             } else if b >= 0x20 {
                                 // Base encoding fallback for printable bytes.
                                 // Most PDFs with simple fonts use WinAnsi/PDFDocEncoding
                                 // semantics, not ISO-8859-1 C1 controls.
-                                Some(decode_single_byte_fallback_char(b, use_cp1252_fallback))
+                                decode_single_byte_fallback_char(b, use_cp1252_fallback).to_string()
                             } else {
-                                None // Skip unmapped control characters
-                            }?;
+                                return None; // Skip unmapped control characters
+                            };
                             // A glyph with no outline paints a gap, whatever
                             // its label says.
-                            if blank_glyph_reads_as_space(Some(encoding), b, &label.to_string()) {
-                                return Some(' ');
+                            if blank_glyph_reads_as_space(Some(encoding), b, &label) {
+                                return Some(" ".to_string());
                             }
                             Some(label)
                         })
@@ -2598,6 +2718,7 @@ mod tests {
                 blank_codes: Default::default(),
                 base: Some(BaseEncoding::WinAnsi),
                 named_codes: Default::default(),
+                sequences: Default::default(),
             },
         );
         let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
@@ -2636,9 +2757,10 @@ mod tests {
             (0x42, "g2".to_string()),
             (0x43, "glyph3".to_string()),
         ];
-        let expected: FontEncodingMap =
-            [(0x41, '\u{03B4}'), (0x42, '\u{03B5}'), (0x43, '\u{03B6}')]
+        let expected: HashMap<u8, String> =
+            [(0x41, "\u{03B4}"), (0x42, "\u{03B5}"), (0x43, "\u{03B6}")]
                 .into_iter()
+                .map(|(code, text)| (code, text.to_string()))
                 .collect();
         assert_eq!(
             glyph_index_chars(&doc, &font, &names, &mut FontStyleCache::new()),
@@ -2680,6 +2802,7 @@ mod tests {
                 blank_codes: Default::default(),
                 base: None,
                 named_codes: [0x81, 0x82, 0x9B].into_iter().collect(),
+                sequences: Default::default(),
             },
         );
         let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
@@ -2707,6 +2830,314 @@ mod tests {
     }
 
     #[test]
+    fn component_ligature_names_read_as_their_letters() {
+        // /Differences naming glyphs by their components — `f_t`, `f_f_i`,
+        // with a suffix, as a uni sequence — read as the letters they join,
+        // in the Differences map's sequences and in the decoded text.
+        let doc = Document::new();
+        let enc = lopdf::dictionary! {
+            "Type" => "Encoding",
+            "Differences" => Object::Array(vec![
+                Object::Integer(0x41),
+                Object::Name(b"f_t".to_vec()),
+                Object::Name(b"f_f_i".to_vec()),
+                Object::Name(b"f_i.liga".to_vec()),
+                Object::Name(b"uni00660069".to_vec()),
+                Object::Name(b"a.sc".to_vec()),
+                Object::Name(b"f_zzz".to_vec()),
+            ])
+        };
+        let result = parse_encoding_dictionary(&doc, &enc, None).expect("parsed");
+        assert_eq!(result.sequences.get(&0x41).map(String::as_str), Some("ft"));
+        assert_eq!(result.sequences.get(&0x42).map(String::as_str), Some("ffi"));
+        assert_eq!(result.sequences.get(&0x43).map(String::as_str), Some("fi"));
+        assert_eq!(result.sequences.get(&0x44).map(String::as_str), Some("fi"));
+        assert_eq!(result.map.get(&0x45), Some(&'a'));
+        assert!(!result.map.contains_key(&0x46) && !result.sequences.contains_key(&0x46));
+        assert!(result.named_codes.contains(&0x46));
+
+        let obj = Object::String(
+            vec![0x41, 0x20, 0x42, 0x45, 0x46],
+            lopdf::StringFormat::Literal,
+        );
+        let font_cmaps = FontCMaps::default();
+        let font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        let inline_cmaps = HashMap::new();
+        let mut font_encodings: PageFontEncodings = HashMap::new();
+        font_encodings.insert(
+            "F0".to_string(),
+            FontEncoding {
+                differences: result.map.clone(),
+                identity_overrides: FontEncodingMap::new(),
+                blank_codes: Default::default(),
+                base: Some(BaseEncoding::WinAnsi),
+                named_codes: result.named_codes.clone(),
+                sequences: result.sequences.clone(),
+            },
+        );
+        let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
+        let mut decisions = CMapDecisionCache::new();
+        let mut font_widths: PageFontWidths = HashMap::new();
+        font_widths.insert("F0".to_string(), make_font_info(&[], 1000, false));
+        let (text, _) = extract_text_from_operand(
+            &obj,
+            "F0",
+            Some("Helvetica"),
+            &font_cmaps,
+            &font_tounicode_refs,
+            &inline_cmaps,
+            &font_encodings,
+            &encoding_cache,
+            &mut decisions,
+            &font_widths,
+        )
+        .expect("text decoded");
+        // "ft", a space, "ffi", "a"; the unreadable `f_zzz` code reads as nothing.
+        assert_eq!(text, "ft ffia");
+    }
+
+    #[test]
+    fn a_code_named_twice_keeps_its_last_name_in_text_and_width() {
+        // `[0x40 /f_i 0x40 /a]`: the later single-character name wins, in
+        // the Differences map and in the base-14 width fallback alike; the
+        // reverse order leaves the ligature.
+        let doc = Document::new();
+        let font = |names: Vec<&[u8]>| {
+            let mut differences = Vec::new();
+            for name in names {
+                differences.push(Object::Integer(0x40));
+                differences.push(Object::Name(name.to_vec()));
+            }
+            lopdf::dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type1",
+                "BaseFont" => "Helvetica",
+                "Encoding" => Object::Dictionary(lopdf::dictionary! {
+                    "Type" => "Encoding",
+                    "Differences" => Object::Array(differences)
+                })
+            }
+        };
+        let last_letter = font(vec![b"f_i", b"a"]);
+        let result = parse_font_encoding(&doc, &last_letter).expect("parsed");
+        assert_eq!(result.map.get(&0x40), Some(&'a'));
+        assert!(!result.sequences.contains_key(&0x40));
+        let widths =
+            base14_fallback_widths(&doc, &last_letter, &mut FontStyleCache::new()).expect("widths");
+        assert_eq!(
+            widths.widths.get(&0x40).copied(),
+            crate::extractor::base14::base14_char_width("Helvetica", 'a')
+        );
+        let last_ligature = font(vec![b"a", b"f_i"]);
+        let result = parse_font_encoding(&doc, &last_ligature).expect("parsed");
+        assert_eq!(result.sequences.get(&0x40).map(String::as_str), Some("fi"));
+        assert!(!result.map.contains_key(&0x40));
+        let widths = base14_fallback_widths(&doc, &last_ligature, &mut FontStyleCache::new())
+            .expect("widths");
+        let fi: u16 = ['f', 'i']
+            .into_iter()
+            .map(|ch| crate::extractor::base14::base14_char_width("Helvetica", ch).unwrap())
+            .sum();
+        assert_eq!(widths.widths.get(&0x40).copied(), Some(fi));
+    }
+
+    #[test]
+    fn a_sequence_of_many_letters_saturates_its_width() {
+        // A `uni` name strings together any number of code points; the
+        // base-14 width of such a code saturates instead of wrapping (or,
+        // in a debug build, overflowing) when its letters outgrow a width.
+        let doc = Document::new();
+        let name = format!("uni{}", "0041".repeat(100));
+        let font = lopdf::dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "Encoding" => Object::Dictionary(lopdf::dictionary! {
+                "Type" => "Encoding",
+                "Differences" => Object::Array(vec![
+                    Object::Integer(0x40),
+                    Object::Name(name.into_bytes()),
+                ])
+            })
+        };
+        let result = parse_font_encoding(&doc, &font).expect("parsed");
+        assert_eq!(result.sequences.get(&0x40).map(String::len), Some(100));
+        let widths =
+            base14_fallback_widths(&doc, &font, &mut FontStyleCache::new()).expect("widths");
+        assert_eq!(widths.widths.get(&0x40).copied(), Some(u16::MAX));
+    }
+
+    #[test]
+    fn a_later_numbered_name_takes_a_code_from_an_earlier_character() {
+        // `[0x40 /a 0x40 /g5]`: the numbered name is the code's last name,
+        // so `a` no longer names it and the code awaits the font program;
+        // `[0x40 /g5 0x40 /a]` leaves the program nothing to resolve.
+        let doc = Document::new();
+        let font = |names: Vec<&[u8]>| {
+            let mut differences = Vec::new();
+            for name in names {
+                differences.push(Object::Integer(0x40));
+                differences.push(Object::Name(name.to_vec()));
+            }
+            lopdf::dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type1",
+                "BaseFont" => "Helvetica",
+                "Encoding" => Object::Dictionary(lopdf::dictionary! {
+                    "Type" => "Encoding",
+                    "Differences" => Object::Array(differences)
+                })
+            }
+        };
+        let numbered_last = parse_font_encoding(&doc, &font(vec![b"a", b"g5"])).expect("parsed");
+        assert!(!numbered_last.map.contains_key(&0x40));
+        assert!(!numbered_last.glyph_names.contains_key(&0x40));
+        assert_eq!(numbered_last.gid_codes, vec![0x40]);
+        assert_eq!(numbered_last.gid_names, vec![(0x40, "g5".to_string())]);
+        let letter_last = parse_font_encoding(&doc, &font(vec![b"g5", b"a"])).expect("parsed");
+        assert_eq!(letter_last.map.get(&0x40), Some(&'a'));
+        assert!(letter_last.gid_codes.is_empty());
+        assert!(letter_last.gid_names.is_empty());
+    }
+
+    #[test]
+    fn a_numbered_name_the_program_reads_as_letters_decodes_and_measures_so() {
+        // The ligature fixture's program names a glyph `f_t`. A font that
+        // reaches that glyph by number after naming the code `a` reads the
+        // code as "ft" — the program's reading of its last name — in its
+        // encoding and, for a standard-14 face without widths, in the
+        // width fallback; named `a` last, the code is `a` in both.
+        let doc = Document::load("tests/fixtures/ligature_glyph_names.pdf").unwrap();
+        let page_id = *doc.get_pages().get(&1).unwrap();
+        let fonts = doc.get_page_fonts(page_id).unwrap();
+        let fixture = (*fonts.get(&b"F1".to_vec()).expect("F1")).clone();
+        let descriptor = resolve_dict(&doc, fixture.get(b"FontDescriptor").unwrap()).unwrap();
+        let program_ref = descriptor
+            .get(b"FontFile2")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let program = font_file_data(&doc, program_ref).expect("program");
+        let face = ttf_parser::Face::parse(&program, 0).unwrap();
+        let ft = format!("g{}", face.glyph_index_by_name("f_t").unwrap().0);
+        let font = |names: Vec<&[u8]>| {
+            let mut differences = Vec::new();
+            for name in names {
+                differences.push(Object::Integer(0x41));
+                differences.push(Object::Name(name.to_vec()));
+            }
+            let mut dict = fixture.clone();
+            dict.set("BaseFont", Object::Name(b"Helvetica".to_vec()));
+            dict.remove(b"Widths");
+            dict.remove(b"FirstChar");
+            dict.remove(b"LastChar");
+            dict.set(
+                "Encoding",
+                Object::Dictionary(lopdf::dictionary! {
+                    "Type" => "Encoding",
+                    "Differences" => Object::Array(differences)
+                }),
+            );
+            dict
+        };
+        let width =
+            |ch: char| crate::extractor::base14::base14_char_width("Helvetica", ch).unwrap();
+        let encoding_of = |dict: &lopdf::Dictionary| {
+            let mut resources = std::collections::BTreeMap::new();
+            resources.insert(b"F1".to_vec(), dict);
+            let (mut encodings, has_gid_fonts) = build_font_encodings(
+                &doc,
+                &resources,
+                &FontCMaps::default(),
+                &mut FontStyleCache::new(),
+            );
+            (encodings.remove("F1").expect("encoding"), has_gid_fonts)
+        };
+
+        let numbered_last = font(vec![b"a", ft.as_bytes()]);
+        let (encoding, has_gid_fonts) = encoding_of(&numbered_last);
+        assert_eq!(
+            encoding.sequences.get(&0x41).map(String::as_str),
+            Some("ft")
+        );
+        assert!(!encoding.differences.contains_key(&0x41));
+        assert!(!has_gid_fonts);
+        let widths = base14_fallback_widths(&doc, &numbered_last, &mut FontStyleCache::new())
+            .expect("widths");
+        assert_eq!(
+            widths.widths.get(&0x41).copied(),
+            Some(width('f') + width('t'))
+        );
+
+        let letter_last = font(vec![ft.as_bytes(), b"a"]);
+        let (encoding, _) = encoding_of(&letter_last);
+        assert_eq!(encoding.differences.get(&0x41), Some(&'a'));
+        assert!(!encoding.sequences.contains_key(&0x41));
+        let widths =
+            base14_fallback_widths(&doc, &letter_last, &mut FontStyleCache::new()).expect("widths");
+        assert_eq!(widths.widths.get(&0x41).copied(), Some(width('a')));
+    }
+
+    #[test]
+    fn a_font_whose_names_all_read_as_nothing_keeps_the_single_byte_fallback() {
+        // `/Differences [0x3D /= 0x3B /;]`: glyphs named by the character
+        // itself, names the glyph list does not know. Such a font gets no
+        // encoding, so its codes read through the single-byte fallback as
+        // the characters they are; with an encoding they would read as
+        // nothing and the text would lose its punctuation.
+        let doc = Document::new();
+        let font = lopdf::dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Times-Roman",
+            "Encoding" => Object::Dictionary(lopdf::dictionary! {
+                "Type" => "Encoding",
+                "Differences" => Object::Array(vec![
+                    Object::Integer(0x3D),
+                    Object::Name(b"=".to_vec()),
+                    Object::Integer(0x3B),
+                    Object::Name(b";".to_vec()),
+                ])
+            })
+        };
+        let mut resources = std::collections::BTreeMap::new();
+        resources.insert(b"F0".to_vec(), &font);
+        let (font_encodings, _) = build_font_encodings(
+            &doc,
+            &resources,
+            &FontCMaps::default(),
+            &mut FontStyleCache::new(),
+        );
+        assert!(!font_encodings.contains_key("F0"));
+
+        let obj = Object::String(
+            vec![0x61_u8, 0x3D, 0x62, 0x3B],
+            lopdf::StringFormat::Literal,
+        );
+        let font_cmaps = FontCMaps::default();
+        let font_tounicode_refs: HashMap<String, u32> = HashMap::new();
+        let inline_cmaps = HashMap::new();
+        let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
+        let mut decisions = CMapDecisionCache::new();
+        let mut font_widths: PageFontWidths = HashMap::new();
+        font_widths.insert("F0".to_string(), make_font_info(&[], 1000, false));
+        let (text, _) = extract_text_from_operand(
+            &obj,
+            "F0",
+            Some("Times-Roman"),
+            &font_cmaps,
+            &font_tounicode_refs,
+            &inline_cmaps,
+            &font_encodings,
+            &encoding_cache,
+            &mut decisions,
+            &font_widths,
+        )
+        .expect("text decoded");
+        assert_eq!(text, "a=b;");
+    }
+
+    #[test]
     fn a_named_but_unmapped_code_reads_as_nothing() {
         // A subset names code 0x81 `gid00136` over a WinAnsi base: the
         // name could not be mapped, and neither WinAnsi's bullet at 0x81
@@ -2726,6 +3157,7 @@ mod tests {
                 blank_codes: Default::default(),
                 base: Some(BaseEncoding::WinAnsi),
                 named_codes: [0x81].into_iter().collect(),
+                sequences: Default::default(),
             },
         );
         let encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
@@ -2807,9 +3239,11 @@ mod tests {
         // (so no width) under a named Latin encoding.
         let alpha = crate::extractor::base14::base14_char_width("Symbol", '\u{03B1}');
         assert!(alpha.is_some());
-        let widths = base14_fallback_widths(&doc, &symbol).expect("Symbol widths");
+        let widths = base14_fallback_widths(&doc, &symbol, &mut FontStyleCache::new())
+            .expect("Symbol widths");
         assert_eq!(widths.widths.get(&0x61).copied(), alpha);
-        let widths = base14_fallback_widths(&doc, &indirect).expect("Symbol widths");
+        let widths = base14_fallback_widths(&doc, &indirect, &mut FontStyleCache::new())
+            .expect("Symbol widths");
         assert_eq!(widths.widths.get(&0x61), None);
         // A control byte gets a width only through the Differences, the
         // one way the decoder reads it.
@@ -2821,10 +3255,12 @@ mod tests {
                 "Differences" => Object::Array(vec![Object::Integer(0x01), Object::Name(b"alpha".to_vec())])
             }),
         );
-        let widths = base14_fallback_widths(&doc, &remapped).expect("Symbol widths");
+        let widths = base14_fallback_widths(&doc, &remapped, &mut FontStyleCache::new())
+            .expect("Symbol widths");
         assert_eq!(widths.widths.get(&0x01).copied(), alpha);
         assert_eq!(widths.widths.get(&0x09), None);
-        let widths = base14_fallback_widths(&doc, &symbol).expect("Symbol widths");
+        let widths = base14_fallback_widths(&doc, &symbol, &mut FontStyleCache::new())
+            .expect("Symbol widths");
         assert_eq!(widths.widths.get(&0x01), None);
     }
 
