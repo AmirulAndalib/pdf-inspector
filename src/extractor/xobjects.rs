@@ -191,11 +191,14 @@ fn collect_xobjects_from_dict(
 /// Text items extracted from a content stream together with the visual-order
 /// RTL evidence gathered while parsing them, for the page-level
 /// `fix_visual_order_rtl` pass: indexes of candidate items (see
-/// `is_visual_rtl_candidate`) and a count of logical-order show ops.
+/// `is_visual_rtl_candidate`) and of the items shown by logical-order ops.
 pub(crate) struct ExtractedText {
     pub(crate) items: Vec<TextItem>,
     pub(crate) rtl_visual_candidates: Vec<usize>,
-    pub(crate) rtl_logical_ops: u32,
+    pub(crate) rtl_logical_runs: Vec<usize>,
+    /// Indexes of the items shown by visible ops of several RTL letters
+    /// painted forwards (see `is_visual_rtl_run`): visual-storage votes.
+    pub(crate) rtl_visual_runs: Vec<usize>,
     /// Baseline angle of every text-producing show operator, in stream
     /// order: this form's share of the page-rotation vote. Per operator,
     /// not per item — one TJ array can split into several items.
@@ -211,7 +214,8 @@ impl ExtractedText {
         Self {
             items: Vec::new(),
             rtl_visual_candidates: Vec::new(),
-            rtl_logical_ops: 0,
+            rtl_logical_runs: Vec::new(),
+            rtl_visual_runs: Vec::new(),
             run_rotations: Vec::new(),
             skipped_invisible: false,
         }
@@ -225,13 +229,15 @@ impl ExtractedText {
         self,
         items: &mut Vec<TextItem>,
         rtl_visual_candidates: &mut Vec<usize>,
-        rtl_logical_ops: &mut u32,
+        rtl_logical_runs: &mut Vec<usize>,
+        rtl_visual_runs: &mut Vec<usize>,
         run_rotations: &mut Vec<f32>,
         skipped_invisible: &mut bool,
     ) {
         let base = items.len();
         rtl_visual_candidates.extend(self.rtl_visual_candidates.into_iter().map(|c| c + base));
-        *rtl_logical_ops += self.rtl_logical_ops;
+        rtl_logical_runs.extend(self.rtl_logical_runs.into_iter().map(|c| c + base));
+        rtl_visual_runs.extend(self.rtl_visual_runs.into_iter().map(|c| c + base));
         run_rotations.extend(self.run_rotations);
         *skipped_invisible |= self.skipped_invisible;
         items.extend(self.items);
@@ -251,6 +257,7 @@ pub(crate) fn extract_form_xobject_text(
     inherited_text_rise: f32,
     inherited_horizontal_scale: f32,
     inherited_text_paint: TextPaint,
+    inherited_fill_is_white: bool,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     budget: &mut FormWalkBudget,
@@ -266,6 +273,7 @@ pub(crate) fn extract_form_xobject_text(
         inherited_text_rise,
         inherited_horizontal_scale,
         inherited_text_paint,
+        inherited_fill_is_white,
         cmap_decisions,
         style_cache,
         0,
@@ -285,6 +293,7 @@ fn extract_form_xobject_text_inner(
     inherited_text_rise: f32,
     inherited_horizontal_scale: f32,
     inherited_text_paint: TextPaint,
+    inherited_fill_is_white: bool,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     depth: u8,
@@ -338,7 +347,8 @@ fn extract_form_xobject_text_inner(
     };
     let items = &mut extracted.items;
     let rtl_visual_candidates = &mut extracted.rtl_visual_candidates;
-    let rtl_logical_ops = &mut extracted.rtl_logical_ops;
+    let rtl_logical_runs = &mut extracted.rtl_logical_runs;
+    let rtl_visual_runs = &mut extracted.rtl_visual_runs;
     let run_rotations = &mut extracted.run_rotations;
     let skipped_invisible = &mut extracted.skipped_invisible;
 
@@ -470,7 +480,9 @@ fn extract_form_xobject_text_inner(
     let mut text_rendering_mode: i32 = inherited_render_mode;
     let mut text_paint = inherited_text_paint;
     let mut in_text_block = false;
-    let mut fill_is_white = false;
+    // The fill colour is graphics state too: a form invoked under a white
+    // fill paints white until it sets its own colour.
+    let mut fill_is_white = inherited_fill_is_white;
     let mut ctm = base_ctm;
 
     // Text state (Tc/Tw/TL/Tf) and the fill colour are part of the graphics
@@ -557,6 +569,7 @@ fn extract_form_xobject_text_inner(
                                         text_rise,
                                         horizontal_scale,
                                         text_paint,
+                                        fill_is_white,
                                         cmap_decisions,
                                         style_cache,
                                         depth + 1,
@@ -565,7 +578,8 @@ fn extract_form_xobject_text_inner(
                                     .append_into(
                                         items,
                                         rtl_visual_candidates,
-                                        rtl_logical_ops,
+                                        rtl_logical_runs,
+                                        rtl_visual_runs,
                                         run_rotations,
                                         skipped_invisible,
                                     );
@@ -766,7 +780,9 @@ fn extract_form_xobject_text_inner(
                     {
                         *skipped_invisible = true;
                     }
-                    if fill_is_white || invisible {
+                    if crate::text_utils::white_fill_hides(text_rendering_mode, fill_is_white)
+                        || invisible
+                    {
                         if let Some(font_info) = font_widths.get(&current_font) {
                             if let Some(raw_bytes) = get_operand_bytes(show_operand) {
                                 let w_ts = compute_string_width_ts(
@@ -882,8 +898,17 @@ fn extract_form_xobject_text_inner(
                             {
                                 if combined[0] * horizontal_scale > 0.0 {
                                     rtl_visual_candidates.push(items.len());
+                                    if !crate::text_utils::white_fill_hides(
+                                        text_rendering_mode,
+                                        fill_is_white,
+                                    ) && crate::text_utils::render_mode_paints(
+                                        text_rendering_mode,
+                                    ) && crate::text_utils::is_visual_rtl_run(&text)
+                                    {
+                                        rtl_visual_runs.push(items.len());
+                                    }
                                 } else {
-                                    *rtl_logical_ops += 1;
+                                    rtl_logical_runs.push(items.len());
                                 }
                             }
                             let painted_bold = paintable_fonts.contains(&current_font)
@@ -970,7 +995,9 @@ fn extract_form_xobject_text_inner(
                         {
                             *skipped_invisible = true;
                         }
-                        let hidden = fill_is_white || invisible;
+                        let hidden =
+                            crate::text_utils::white_fill_hides(text_rendering_mode, fill_is_white)
+                                || invisible;
                         let font_info = font_widths.get(&current_font);
 
                         // Word-space threshold for `TJ` offsets and character
@@ -1317,14 +1344,22 @@ fn extract_form_xobject_text_inner(
                                     && crate::text_utils::is_visual_rtl_candidate(text)
                                 {
                                     if scale_x < 0.0 {
-                                        *rtl_logical_ops += 1;
+                                        rtl_logical_runs.push(items.len());
                                     } else if backward_jump {
                                         if !op_backtrack_voted {
-                                            *rtl_logical_ops += 1;
+                                            rtl_logical_runs.push(items.len());
                                             op_backtrack_voted = true;
                                         }
                                     } else {
                                         rtl_visual_candidates.push(items.len());
+                                        if !hidden
+                                            && crate::text_utils::render_mode_paints(
+                                                text_rendering_mode,
+                                            )
+                                            && crate::text_utils::is_visual_rtl_run(text)
+                                        {
+                                            rtl_visual_runs.push(items.len());
+                                        }
                                     }
                                 }
                                 if let Some(pending) = pending_space.take() {
@@ -1542,6 +1577,7 @@ mod tests {
             0.0,
             1.0,
             TextPaint::default(),
+            false,
             &mut CMapDecisionCache::new(),
             &mut FontStyleCache::new(),
             budget,
