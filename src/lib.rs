@@ -150,6 +150,34 @@ pub struct PageOcrReasons {
     pub reasons: Vec<String>,
 }
 
+/// A font whose ToUnicode CMap (or, for a font without one, the embedded
+/// program's own cmap table) had no entry for some of the codes the document
+/// shows through it, and what became of those codes.
+///
+/// A CMap written for some of a font's glyphs but not all of them loses the
+/// others' letters from the text. A code without an entry is read from the
+/// mapped codes around it when they spell it out — a CMap mapping code 36
+/// to `A` and code 38 to `C` says code 37 is `B`, for a run of digits or of
+/// letters of one case whose glyph order follows the alphabet — and is a
+/// U+FFFD in the text otherwise, so the loss stays visible. The counts let
+/// a caller weigh text read from such a font: `codes - interpolated -
+/// unmapped` of its codes had an entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontCMapGaps {
+    /// The font's `/BaseFont` name, or its resource name when it has none
+    /// or an empty one.
+    pub font: String,
+    /// Codes shown through the font's CMap, repeats included: two-byte
+    /// codes, or the bytes of a single-byte CMap.
+    pub codes: u32,
+    /// Codes without an entry that were read from the mapped codes around
+    /// them.
+    pub interpolated: u32,
+    /// Codes without an entry that could not be read; each is a U+FFFD in
+    /// the text.
+    pub unmapped: u32,
+}
+
 /// High-level PDF processing result.
 #[derive(Debug)]
 pub struct PdfProcessResult {
@@ -174,6 +202,13 @@ pub struct PdfProcessResult {
     /// `true` when broken font encodings are detected (garbled text,
     /// replacement characters). Clients should fall back to OCR.
     pub has_encoding_issues: bool,
+    /// The fonts whose ToUnicode CMap — or, for a font without one, the
+    /// embedded program's cmap table — lacked an entry for a code the
+    /// document shows through it, with the counts of codes shown, read from
+    /// their neighbours and left as U+FFFD (see [`FontCMapGaps`]). Always
+    /// empty in [`ProcessMode::DetectOnly`], which decodes no text;
+    /// otherwise empty when every such code had an entry.
+    pub cmap_gaps: Vec<FontCMapGaps>,
 }
 
 // =========================================================================
@@ -586,7 +621,7 @@ fn extract_pages_markdown_mem_impl(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations) =
+    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations, _) =
         if let Some(required_pages) = required_pages.as_ref() {
             extractor::extract_positioned_text_for_document_analysis(
                 &doc,
@@ -4537,6 +4572,7 @@ fn process_document(
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            cmap_gaps: Vec::new(),
         });
     }
 
@@ -4553,6 +4589,7 @@ fn process_document(
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            cmap_gaps: Vec::new(),
         });
     }
 
@@ -4572,7 +4609,7 @@ fn process_document(
         // (mostly non-alphanumeric), retry with invisible (Tr=3) text included.
         // This unlocks OCR text layers behind scanned images.
         if pdf_type == PdfType::Mixed {
-            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _)| e) {
+            if let Ok((ref items, _, _)) = result.as_ref().map(|(e, _, _, _, _)| e) {
                 let sample: String = items
                     .iter()
                     .filter(|item| {
@@ -4639,8 +4676,15 @@ fn process_document(
         gid_pages,
         text_quality_pages,
         text_quality_reasons_by_page,
+        cmap_gaps,
     ) = match extracted {
-        Some(((items, rects, lines), page_thresholds, gid_encoded_pages, _page_rotations)) => {
+        Some((
+            (items, rects, lines),
+            page_thresholds,
+            gid_encoded_pages,
+            _page_rotations,
+            cmap_coverage,
+        )) => {
             let mut ocr_reasons_by_page = BTreeMap::new();
 
             // For TextBased PDFs with pages flagged for OCR (Identity-H or
@@ -4765,8 +4809,13 @@ fn process_document(
                 ))
             };
 
+            // A code no CMap could read is an encoding issue whether or not
+            // the Markdown that would show its U+FFFD is generated in this
+            // mode; a gap read from its neighbours is not one.
+            let cmap_unmapped = cmap_coverage.values().any(|stats| stats.unmapped > 0);
             let enc = !ocr_reasons_by_page.is_empty()
                 || text_quality.has_encoding_issues
+                || cmap_unmapped
                 || md.as_ref().is_some_and(|m| detect_encoding_issues(m));
             (
                 md,
@@ -4775,6 +4824,7 @@ fn process_document(
                 gid_encoded_pages,
                 text_quality.pages_needing_ocr,
                 ocr_reasons_by_page,
+                font_cmap_gaps(cmap_coverage),
             )
         }
         None => (
@@ -4784,6 +4834,7 @@ fn process_document(
             std::collections::HashSet::new(),
             Vec::new(),
             BTreeMap::new(),
+            Vec::new(),
         ),
     };
 
@@ -4888,7 +4939,23 @@ fn process_document(
         confidence,
         layout,
         has_encoding_issues,
+        cmap_gaps,
     })
+}
+
+/// The fonts whose CMap lacked an entry for a code shown through it, with
+/// their counts, from the per-font coverage of an extraction.
+fn font_cmap_gaps(coverage: types::CMapCoverageByFont) -> Vec<FontCMapGaps> {
+    coverage
+        .into_iter()
+        .filter(|(_, stats)| stats.has_gaps())
+        .map(|(font, stats)| FontCMapGaps {
+            font,
+            codes: stats.codes,
+            interpolated: stats.interpolated,
+            unmapped: stats.unmapped,
+        })
+        .collect()
 }
 
 // =========================================================================

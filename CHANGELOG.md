@@ -11,6 +11,23 @@ version and date. Earlier releases are described in their
 
 Changes since 1.22.1.
 
+### Added
+
+- `PdfProcessResult::cmap_gaps`: the fonts whose ToUnicode CMap (or, for a
+  font without one, the embedded program's cmap table) had no entry for
+  some of the codes the document shows through it, each a
+  `FontCMapGaps` with the font's `/BaseFont` name (or its resource name
+  when it has none) and the counts of `codes` shown, `interpolated` (read
+  from the mapped codes around them, see below) and `unmapped` (left as
+  U+FFFD). The list is always empty in `ProcessMode::DetectOnly`
+  (`detect_pdf`, `detectPdf`, `detect-pdf` without `--analyze`), which
+  decodes no text, and otherwise empty when every such code had an entry.
+  Node `cmapGaps` (`FontCmapGaps[]`), Python `cmap_gaps`
+  (`list[FontCMapGaps]`), the WebAssembly result's `cmapGaps` and the
+  `pdf2md --json` and `detect-pdf --analyze --json` field `cmap_gaps` report
+  the same list.
+  ([#568](https://github.com/firecrawl/pdf-inspector/pull/568))
+
 ### Fixed
 
 - A Form XObject whose `/BBox` holds numerals too large for any parser —
@@ -152,6 +169,20 @@ Changes since 1.22.1.
   image with no text keep their classification and reasons; what is
   extracted is unchanged.
   ([#566](https://github.com/firecrawl/pdf-inspector/pull/566))
+- A two-byte code of a CID-keyed font whose ToUnicode CMap has no entry for
+  it is read from the mapped codes around it when they spell it out: a CMap
+  mapping code 36 to `A` and code 38 to `C` says code 37 is `B`, for a gap
+  inside a run of digits, of upper-case or of lower-case letters of one
+  script whose code points lie exactly as far apart as the codes and whose
+  entries rise with their codes, as the glyph order of most fonts does. Such
+  codes came out as nothing, so a word set with one lost its letters while
+  the document still read as clean text. A gap next to punctuation, across
+  a change of case or of script, at the edge of the mapped codes, beside an
+  entry of several characters or in a CMap whose entries do not follow the
+  alphabet is not read; such a code is now a U+FFFD in the text instead of
+  nothing, as a code of a CID font whose CMap cannot be read at all already
+  was, so the loss stays visible and `has_encoding_issues` reports it.
+  ([#568](https://github.com/firecrawl/pdf-inspector/pull/568))
 
 ## [1.22.1] - 2026-09-20
 

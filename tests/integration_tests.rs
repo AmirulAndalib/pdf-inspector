@@ -2109,6 +2109,7 @@ fn test_pages_needing_ocr_field_accessible() {
         confidence: 1.0,
         layout: pdf_inspector::LayoutComplexity::default(),
         has_encoding_issues: false,
+        cmap_gaps: Vec::new(),
     };
     assert_eq!(process_result.pages_needing_ocr, vec![1, 3]);
 }
@@ -5747,6 +5748,638 @@ fn test_synthetic_type0_broken_tounicode_emits_fffd_not_latin1_mojibake() {
         "Type0 page with broken ToUnicode + non-ASCII bytes must be flagged for OCR; \
          pages_needing_ocr={:?}",
         result.pages_needing_ocr
+    );
+}
+
+// ============================================================================
+// Type0/Identity-H font whose ToUnicode CMap has gaps
+// ============================================================================
+
+/// A one-page document showing `lines` — each a run of two-byte codes shown
+/// by one `Tj` — through a Type0/Identity-H font whose embedded subset (see
+/// `minimal_truetype_subset`) has neither a cmap nor glyph names, so the
+/// font's ToUnicode CMap — `bfrange` lines of `(first, last, base)` — is the
+/// only reading of the codes.
+fn make_type0_pdf_with_tounicode_ranges(ranges: &[(u16, u16, u32)], lines: &[&[u16]]) -> Vec<u8> {
+    make_type0_pdf_with_tounicode_ranges_spaced(ranges, lines, 0.0)
+}
+
+/// A Type0/Identity-H font added to `doc`, whose embedded subset (see
+/// `minimal_truetype_subset`, with `highest_code` glyphs after `.notdef`)
+/// has neither a cmap nor glyph names, so the font's ToUnicode CMap —
+/// `bfrange` lines of `(first, last, base)` — is the only reading of its
+/// codes.
+fn add_type0_font_with_tounicode_ranges(
+    doc: &mut lopdf::Document,
+    ranges: &[(u16, u16, u32)],
+    highest_code: u16,
+) -> lopdf::ObjectId {
+    use lopdf::{dictionary, Object, Stream};
+
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+         /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+         1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+    );
+    cmap.push_str(&format!("{} beginbfrange\n", ranges.len()));
+    for &(first, last, base) in ranges {
+        cmap.push_str(&format!("<{first:04X}> <{last:04X}> <{base:04X}>\n"));
+    }
+    cmap.push_str("endbfrange\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+
+    let font_file = minimal_truetype_subset(usize::from(highest_code));
+    let font_file_id = doc.add_object(Stream::new(
+        dictionary! { "Length1" => font_file.len() as i64 },
+        font_file,
+    ));
+    let descriptor_id = doc.add_object(dictionary! {
+        "Type" => "FontDescriptor",
+        "FontName" => "AAAAAA+Subset",
+        "Flags" => 4,
+        "FontBBox" => vec![0.into(), 0.into(), 600.into(), 700.into()],
+        "ItalicAngle" => 0,
+        "Ascent" => 700,
+        "Descent" => 0,
+        "CapHeight" => 700,
+        "StemV" => 80,
+        "FontFile2" => font_file_id,
+    });
+    let cid_font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "CIDFontType2",
+        "BaseFont" => "AAAAAA+Subset",
+        "CIDSystemInfo" => dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("Identity"),
+            "Supplement" => 0,
+        },
+        "FontDescriptor" => descriptor_id,
+        "DW" => 600,
+        "CIDToGIDMap" => "Identity",
+    });
+    let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+    doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type0",
+        "BaseFont" => "AAAAAA+Subset",
+        "Encoding" => "Identity-H",
+        "DescendantFonts" => vec![cid_font_id.into()],
+        "ToUnicode" => cmap_id,
+    })
+}
+
+/// A one-page document showing `lines` — each a run of two-byte codes shown
+/// by one `Tj`, with `char_spacing` between its glyphs — through the font of
+/// `add_type0_font_with_tounicode_ranges`.
+fn make_type0_pdf_with_tounicode_ranges_spaced(
+    ranges: &[(u16, u16, u32)],
+    lines: &[&[u16]],
+    char_spacing: f32,
+) -> Vec<u8> {
+    let highest_code = lines
+        .iter()
+        .flat_map(|line| line.iter())
+        .chain(ranges.iter().map(|(_, last, _)| last))
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let mut doc = lopdf::Document::with_version("1.5");
+    let font_id = add_type0_font_with_tounicode_ranges(&mut doc, ranges, highest_code);
+
+    let spacing = if char_spacing > 0.0 {
+        format!("{char_spacing} Tc ")
+    } else {
+        String::new()
+    };
+    let mut content = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        let hex: String = line.iter().map(|code| format!("{code:04X}")).collect();
+        content.push_str(&format!(
+            "BT /F1 12 Tf {spacing}72 {} Td <{hex}> Tj ET\n",
+            700 - 20 * index
+        ));
+    }
+    let pages_id = doc.new_object_id();
+    let page_id = add_page(
+        &mut doc,
+        pages_id,
+        &content,
+        LETTER_BOX,
+        None,
+        &[("F1", font_id)],
+    );
+    finish_document(doc, pages_id, vec![page_id])
+}
+
+/// A US-letter page box, in points.
+const LETTER_BOX: [i64; 4] = [0, 0, 612, 792];
+
+/// A page of `content` added to `doc` under the page tree `pages_id`, with
+/// `media_box`, `crop_box` when given, and the fonts named in `fonts`;
+/// returns the page's id.
+fn add_page(
+    doc: &mut lopdf::Document,
+    pages_id: lopdf::ObjectId,
+    content: &str,
+    media_box: [i64; 4],
+    crop_box: Option<[i64; 4]>,
+    fonts: &[(&str, lopdf::ObjectId)],
+) -> lopdf::ObjectId {
+    use lopdf::{dictionary, Object, Stream};
+
+    let boxed = |b: [i64; 4]| -> Object { Object::Array(b.iter().map(|&v| v.into()).collect()) };
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+    let mut font_dict = lopdf::Dictionary::new();
+    for &(name, id) in fonts {
+        font_dict.set(name, id);
+    }
+    let mut page = dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => boxed(media_box),
+        "Resources" => dictionary! { "Font" => font_dict },
+        "Contents" => content_id,
+    };
+    if let Some(crop_box) = crop_box {
+        page.set("CropBox", boxed(crop_box));
+    }
+    doc.add_object(page)
+}
+
+/// `doc` finished with the page tree `pages_id` over `kids` and a catalog,
+/// serialized.
+fn finish_document(
+    mut doc: lopdf::Document,
+    pages_id: lopdf::ObjectId,
+    kids: Vec<lopdf::ObjectId>,
+) -> Vec<u8> {
+    use lopdf::dictionary;
+
+    let count = kids.len() as i64;
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids.into_iter().map(Into::into).collect::<Vec<lopdf::Object>>(),
+            "Count" => count,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// Codes of the standard glyph order: space at 3, digits at 19..28, A..Z at
+/// 36..61 and a..z at 68..93.
+fn standard_order_codes(text: &str) -> Vec<u16> {
+    text.chars()
+        .map(|c| match c {
+            ' ' => 3,
+            '0'..='9' => 19 + (c as u16 - '0' as u16),
+            'A'..='Z' => 36 + (c as u16 - 'A' as u16),
+            'a'..='z' => 68 + (c as u16 - 'a' as u16),
+            other => panic!("no code for {other:?}"),
+        })
+        .collect()
+}
+
+/// The lines the gap fixtures show: the letters J, O and P and the digit 3
+/// sit in the holes of the gapped CMap.
+const CMAP_GAP_LINES: [&str; 3] = ["JAZZ POLKA", "ZIP 30 4212", "POP QUIZ"];
+
+/// Detection reads a page's strings as raw bytes, and two-byte codes yield
+/// few ASCII letters and digits; such a page counts as text only when it
+/// shows text through a decodable font in ten or more operators, so each
+/// fixture shows its lines this many times over.
+const SHOWINGS: usize = 4;
+
+/// `lines`, each shown `SHOWINGS` times.
+fn shown_lines<'a>(lines: &[&'a [u16]]) -> Vec<&'a [u16]> {
+    std::iter::repeat_n(lines, SHOWINGS)
+        .flatten()
+        .copied()
+        .collect()
+}
+
+/// `texts`, each `SHOWINGS` times, as the items of a fixture read.
+fn shown_texts(texts: &[&str]) -> Vec<String> {
+    std::iter::repeat_n(texts, SHOWINGS)
+        .flatten()
+        .map(|text| text.to_string())
+        .collect()
+}
+
+fn cmap_gap_lines() -> Vec<Vec<u16>> {
+    CMAP_GAP_LINES
+        .iter()
+        .map(|line| standard_order_codes(line))
+        .collect()
+}
+
+/// A CMap covering the space, the digits and A..Z.
+const FULL_RANGES: [(u16, u16, u32); 3] = [(3, 3, 0x20), (19, 28, 0x30), (36, 61, 0x41)];
+
+/// The same CMap with holes at 45 (J) and 50..51 (O, P), and at 22 (3).
+const GAPPED_RANGES: [(u16, u16, u32); 6] = [
+    (3, 3, 0x20),
+    (19, 21, 0x30),
+    (23, 28, 0x34),
+    (36, 44, 0x41),
+    (46, 49, 0x4B),
+    (52, 61, 0x51),
+];
+
+#[test]
+fn test_tounicode_gaps_inside_letter_and_digit_runs_read_as_the_characters_between() {
+    let lines = cmap_gap_lines();
+    let base: Vec<&[u16]> = lines.iter().map(Vec::as_slice).collect();
+    let shown = shown_lines(&base);
+    let gapped = make_type0_pdf_with_tounicode_ranges(&GAPPED_RANGES, &shown);
+    let full = make_type0_pdf_with_tounicode_ranges(&FULL_RANGES, &shown);
+
+    let gapped_text: Vec<String> =
+        pdf_inspector::extractor::extract_text_with_positions_mem(&gapped)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.text)
+            .collect();
+    assert_eq!(
+        gapped_text,
+        shown_texts(&CMAP_GAP_LINES),
+        "the holes read as J, O, P and 3"
+    );
+
+    // The text reads exactly as it does through the complete CMap.
+    let gapped_result = pdf_inspector::process_pdf_mem(&gapped).unwrap();
+    let full_result = pdf_inspector::process_pdf_mem(&full).unwrap();
+    assert_eq!(gapped_result.markdown, full_result.markdown);
+    assert!(gapped_result
+        .markdown
+        .as_deref()
+        .unwrap()
+        .contains("JAZZ POLKA"));
+    assert!(!gapped_result.has_encoding_issues);
+    assert!(gapped_result.pages_needing_ocr.is_empty());
+
+    // J, O, P and 3 are shown eight times over the three lines.
+    let codes: u32 = shown.iter().map(|line| line.len() as u32).sum();
+    let in_holes = shown
+        .iter()
+        .flat_map(|line| line.iter())
+        .filter(|code| matches!(code, 22 | 45 | 50 | 51))
+        .count() as u32;
+    assert_eq!(in_holes, 8 * SHOWINGS as u32);
+    assert_eq!(
+        gapped_result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes,
+            interpolated: in_holes,
+            unmapped: 0,
+        }]
+    );
+    assert!(full_result.cmap_gaps.is_empty());
+}
+
+#[test]
+fn test_tounicode_gap_across_a_change_of_case_or_kind_reads_as_a_replacement_character() {
+    // Z at 61 and a at 68, and 9 at 28 and A at 36, lie as far apart in
+    // code point as in code, but a gap is never read across a change of
+    // case or between a digit and a letter.
+    let ranges = [(3, 3, 0x20), (19, 28, 0x30), (36, 61, 0x41), (68, 93, 0x61)];
+    let base: [&[u16]; 3] = [&[36, 62, 68], &[28, 30, 36], &[68, 69, 70]];
+    let pdf = make_type0_pdf_with_tounicode_ranges(&ranges, &shown_lines(&base));
+
+    let text: Vec<String> = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.text)
+        .collect();
+    assert_eq!(text, shown_texts(&["A\u{FFFD}a", "9\u{FFFD}A", "abc"]));
+
+    let result = pdf_inspector::process_pdf_mem(&pdf).unwrap();
+    assert!(result.markdown.as_deref().unwrap().contains('\u{FFFD}'));
+    assert!(result.has_encoding_issues);
+    assert_eq!(
+        result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes: 9 * SHOWINGS as u32,
+            interpolated: 0,
+            unmapped: 2 * SHOWINGS as u32,
+        }]
+    );
+}
+
+#[test]
+fn test_tounicode_gap_at_the_edge_of_the_mapped_codes_reads_as_a_replacement_character() {
+    // A..I only: code 45 has no mapped code above it.
+    let ranges = [(3, 3, 0x20), (36, 44, 0x41)];
+    let base: [&[u16]; 3] = [&[44, 45], &[36, 37, 38], &[39, 40, 41]];
+    let pdf = make_type0_pdf_with_tounicode_ranges(&ranges, &shown_lines(&base));
+
+    let text: Vec<String> = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.text)
+        .collect();
+    assert_eq!(text, shown_texts(&["I\u{FFFD}", "ABC", "DEF"]));
+
+    let result = pdf_inspector::process_pdf_mem(&pdf).unwrap();
+    assert!(result.has_encoding_issues);
+    assert_eq!(
+        result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes: 8 * SHOWINGS as u32,
+            interpolated: 0,
+            unmapped: SHOWINGS as u32,
+        }]
+    );
+}
+
+#[test]
+fn test_fully_mapped_tounicode_reports_no_gaps() {
+    let lines = cmap_gap_lines();
+    let base: Vec<&[u16]> = lines.iter().map(Vec::as_slice).collect();
+    let pdf = make_type0_pdf_with_tounicode_ranges(&FULL_RANGES, &shown_lines(&base));
+
+    let text: Vec<String> = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.text)
+        .collect();
+    assert_eq!(text, shown_texts(&CMAP_GAP_LINES));
+
+    let result = pdf_inspector::process_pdf_mem(&pdf).unwrap();
+    assert!(!result.has_encoding_issues);
+    assert!(result.cmap_gaps.is_empty());
+    assert!(!result.markdown.as_deref().unwrap().contains('\u{FFFD}'));
+
+    // Detection alone reads no text, and reports no gaps.
+    let detected = pdf_inspector::process_pdf_mem_with_options(
+        &pdf,
+        pdf_inspector::PdfOptions::new().mode(pdf_inspector::ProcessMode::DetectOnly),
+    )
+    .unwrap();
+    assert!(detected.cmap_gaps.is_empty());
+}
+
+#[test]
+fn test_word_gap_analysis_does_not_count_a_string_twice() {
+    // Three codes shown with a character spacing wide enough for a word gap
+    // are decoded once more, one code at a time, by the word-gap analysis
+    // of the string; the coverage counts the string once, and the text —
+    // its spaces included — reads exactly as through the complete CMap.
+    // J, O and P sit in the holes of the CMap.
+    let base: [&[u16]; 3] = [&[45, 36, 61], &[51, 50, 47], &[46, 36, 55]];
+    let shown = shown_lines(&base);
+    let gapped = make_type0_pdf_with_tounicode_ranges_spaced(&GAPPED_RANGES, &shown, 4.0);
+    let full = make_type0_pdf_with_tounicode_ranges_spaced(&FULL_RANGES, &shown, 4.0);
+
+    let texts = |pdf: &[u8]| -> Vec<String> {
+        pdf_inspector::extractor::extract_text_with_positions_mem(pdf)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.text)
+            .collect()
+    };
+    let gapped_texts = texts(&gapped);
+    assert_eq!(gapped_texts, texts(&full));
+    assert_eq!(gapped_texts.len(), 3 * SHOWINGS);
+    for (text, letters) in gapped_texts
+        .iter()
+        .zip(["JAZ", "POL", "KAT"].iter().cycle())
+    {
+        assert_eq!(text.replace(' ', ""), *letters, "{text:?}");
+    }
+
+    let gapped_result = pdf_inspector::process_pdf_mem(&gapped).unwrap();
+    let full_result = pdf_inspector::process_pdf_mem(&full).unwrap();
+    assert_eq!(gapped_result.markdown, full_result.markdown);
+    assert!(full_result.cmap_gaps.is_empty());
+    assert_eq!(
+        gapped_result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes: 9 * SHOWINGS as u32,
+            interpolated: 3 * SHOWINGS as u32,
+            unmapped: 0,
+        }]
+    );
+}
+
+/// Four pages with a recurring page number at the page's edge beside a
+/// footer, as `make_recurring_contextual_folio_pdf` builds them, whose pages
+/// after the first also show lines through the font of
+/// `add_type0_font_with_tounicode_ranges` with `GAPPED_RANGES`.
+fn make_contextual_folio_pdf_with_gapped_later_pages() -> Vec<u8> {
+    use lopdf::{dictionary, Document};
+
+    let lines = cmap_gap_lines();
+    let base: Vec<&[u16]> = lines.iter().map(Vec::as_slice).collect();
+    let shown = shown_lines(&base);
+    let highest_code = shown
+        .iter()
+        .flat_map(|line| line.iter())
+        .chain(GAPPED_RANGES.iter().map(|(_, last, _)| last))
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let mut doc = Document::with_version("1.5");
+    let gapped_font_id =
+        add_type0_font_with_tounicode_ranges(&mut doc, &GAPPED_RANGES, highest_code);
+    let text_font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let pages_id = doc.new_object_id();
+    let mut kids = Vec::new();
+    for page_number in 1..=4u32 {
+        let mut content = format!(
+            "BT /F1 12 Tf 1 0 0 1 25 30 Tm ({page_number}) Tj 1 0 0 1 41 30 Tm (Company report footer) Tj 1 0 0 1 72 700 Tm (Body page {page_number}) Tj ET\n"
+        );
+        if page_number > 1 {
+            for (index, line) in shown.iter().enumerate() {
+                let hex: String = line.iter().map(|code| format!("{code:04X}")).collect();
+                content.push_str(&format!(
+                    "BT /F2 12 Tf 72 {} Td <{hex}> Tj ET\n",
+                    660 - 20 * index
+                ));
+            }
+        }
+        kids.push(add_page(
+            &mut doc,
+            pages_id,
+            &content,
+            LETTER_BOX,
+            None,
+            &[("F1", text_font_id), ("F2", gapped_font_id)],
+        ));
+    }
+    finish_document(doc, pages_id, kids)
+}
+
+#[test]
+fn test_page_filter_reports_no_cmap_gaps_from_context_pages() {
+    let pdf = make_contextual_folio_pdf_with_gapped_later_pages();
+
+    // The first page alone: its folio needs the other pages' evidence, which
+    // is gathered — the folio goes — while the gaps of the font only those
+    // pages show stay out of the result, as their text does.
+    let result = process_pdf_mem_with_options(&pdf, PdfOptions::new().pages([1])).unwrap();
+    let markdown = result.markdown.unwrap();
+    assert!(markdown.contains("Company report footer"));
+    assert!(!markdown.contains("1 Company report footer"), "{markdown}");
+    assert!(!markdown.contains("JAZZ"));
+    assert!(result.cmap_gaps.is_empty(), "{:?}", result.cmap_gaps);
+
+    // A page that shows the font reports it.
+    let result = process_pdf_mem_with_options(&pdf, PdfOptions::new().pages([2])).unwrap();
+    assert!(result.markdown.unwrap().contains("JAZZ POLKA"));
+    assert_eq!(result.cmap_gaps.len(), 1, "{:?}", result.cmap_gaps);
+    assert_eq!(result.cmap_gaps[0].font, "AAAAAA+Subset");
+    assert!(result.cmap_gaps[0].interpolated > 0);
+    assert_eq!(result.cmap_gaps[0].unmapped, 0);
+}
+
+#[test]
+fn test_blank_runs_count_towards_the_cmap_coverage() {
+    // A run of a single space code makes no item, yet its code was shown
+    // through the CMap: it counts with the next run's, and the text is the
+    // same as without it.
+    let base: [&[u16]; 3] = [&[3], &[45, 36, 61, 61], &[3]];
+    let shown = shown_lines(&base);
+    let pdf = make_type0_pdf_with_tounicode_ranges(&GAPPED_RANGES, &shown);
+    let text: Vec<String> = pdf_inspector::extractor::extract_text_with_positions_mem(&pdf)
+        .unwrap()
+        .into_iter()
+        .map(|item| item.text)
+        .collect();
+    assert_eq!(text, vec!["JAZZ"; SHOWINGS]);
+    let result = pdf_inspector::process_pdf_mem(&pdf).unwrap();
+    assert_eq!(
+        result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes: 6 * SHOWINGS as u32,
+            interpolated: SHOWINGS as u32,
+            unmapped: 0,
+        }]
+    );
+}
+
+#[test]
+fn test_analyze_mode_reports_unmapped_cmap_codes_as_encoding_issues() {
+    // Analysis generates no Markdown, so the U+FFFD a code no CMap could
+    // read would show is never seen there; the flag follows the coverage
+    // instead, in both modes alike, and a gap read from its neighbours does
+    // not raise it.
+    let analyze = || pdf_inspector::PdfOptions::new().mode(pdf_inspector::ProcessMode::Analyze);
+    let lines = cmap_gap_lines();
+    let base: Vec<&[u16]> = lines.iter().map(Vec::as_slice).collect();
+    let interpolated_only =
+        make_type0_pdf_with_tounicode_ranges(&GAPPED_RANGES, &shown_lines(&base));
+    let edge: [&[u16]; 3] = [&[44, 45], &[36, 37, 38], &[39, 40, 41]];
+    let unmapped =
+        make_type0_pdf_with_tounicode_ranges(&[(3, 3, 0x20), (36, 44, 0x41)], &shown_lines(&edge));
+
+    let analyzed = pdf_inspector::process_pdf_mem_with_options(&unmapped, analyze()).unwrap();
+    assert!(analyzed.markdown.is_none());
+    assert!(analyzed.has_encoding_issues);
+    assert_eq!(analyzed.cmap_gaps.len(), 1);
+    assert!(analyzed.cmap_gaps[0].unmapped > 0);
+    let processed = pdf_inspector::process_pdf_mem(&unmapped).unwrap();
+    assert!(processed.has_encoding_issues);
+    assert_eq!(processed.cmap_gaps, analyzed.cmap_gaps);
+
+    let analyzed =
+        pdf_inspector::process_pdf_mem_with_options(&interpolated_only, analyze()).unwrap();
+    assert!(analyzed.markdown.is_none());
+    assert!(!analyzed.has_encoding_issues);
+    assert_eq!(analyzed.cmap_gaps.len(), 1);
+    assert!(analyzed.cmap_gaps[0].interpolated > 0);
+    assert_eq!(analyzed.cmap_gaps[0].unmapped, 0);
+    let processed = pdf_inspector::process_pdf_mem(&interpolated_only).unwrap();
+    assert!(!processed.has_encoding_issues);
+    assert_eq!(processed.cmap_gaps, analyzed.cmap_gaps);
+}
+
+/// A spread whose page box (its `/CropBox`) is the left half of the sheet:
+/// the lines of `cmap_gap_lines` shown through the font of
+/// `add_type0_font_with_tounicode_ranges` with `GAPPED_RANGES` once inside
+/// the box and once again, on other baselines, out on the right half, as a
+/// single-page extract of an imposed spread keeps its neighbour's text.
+fn make_spread_pdf_with_gapped_font_off_page() -> Vec<u8> {
+    use lopdf::Document;
+
+    let lines = cmap_gap_lines();
+    let base: Vec<&[u16]> = lines.iter().map(Vec::as_slice).collect();
+    let shown = shown_lines(&base);
+    let highest_code = shown
+        .iter()
+        .flat_map(|line| line.iter())
+        .chain(GAPPED_RANGES.iter().map(|(_, last, _)| last))
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let mut doc = Document::with_version("1.5");
+    let font_id = add_type0_font_with_tounicode_ranges(&mut doc, &GAPPED_RANGES, highest_code);
+    let mut content = String::new();
+    for (index, line) in shown.iter().enumerate() {
+        let hex: String = line.iter().map(|code| format!("{code:04X}")).collect();
+        content.push_str(&format!(
+            "BT /F1 12 Tf 72 {} Td <{hex}> Tj ET\n",
+            700 - 20 * index
+        ));
+        content.push_str(&format!(
+            "BT /F1 12 Tf 700 {} Td <{hex}> Tj ET\n",
+            690 - 20 * index
+        ));
+    }
+    let pages_id = doc.new_object_id();
+    let page_id = add_page(
+        &mut doc,
+        pages_id,
+        &content,
+        [0, 0, 1224, 792],
+        Some(LETTER_BOX),
+        &[("F1", font_id)],
+    );
+    finish_document(doc, pages_id, vec![page_id])
+}
+
+#[test]
+fn test_text_outside_the_page_box_takes_its_cmap_coverage_with_it() {
+    let pdf = make_spread_pdf_with_gapped_font_off_page();
+    let result = pdf_inspector::process_pdf_mem(&pdf).unwrap();
+    let markdown = result.markdown.as_deref().unwrap();
+    // The neighbour's text is left out of the page ...
+    assert_eq!(
+        markdown.matches("JAZZ POLKA").count(),
+        SHOWINGS,
+        "{markdown}"
+    );
+    // ... and so are its codes: the coverage is that of the lines in the box.
+    let lines = cmap_gap_lines();
+    let codes: u32 = lines.iter().map(|line| line.len() as u32).sum::<u32>() * SHOWINGS as u32;
+    assert_eq!(
+        result.cmap_gaps,
+        vec![pdf_inspector::FontCMapGaps {
+            font: "AAAAAA+Subset".to_string(),
+            codes,
+            interpolated: 8 * SHOWINGS as u32,
+            unmapped: 0,
+        }]
     );
 }
 
