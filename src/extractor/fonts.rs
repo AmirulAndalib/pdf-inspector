@@ -822,7 +822,7 @@ pub(crate) fn build_font_encodings(
         let resource_name = String::from_utf8_lossy(font_name).to_string();
 
         let mut differences = FontEncodingMap::new();
-        let mut identity_overrides = FontEncodingMap::new();
+        let mut identity_overrides = HashMap::new();
         let mut base: Option<BaseEncoding> = None;
         let mut named_codes = std::collections::HashSet::new();
         let mut sequences: HashMap<u8, String> = HashMap::new();
@@ -859,10 +859,16 @@ pub(crate) fn build_font_encodings(
             if !unresolved.is_empty() && !tounicode_maps_codes(font_dict, cmaps, &unresolved) {
                 has_gid_fonts = true;
             }
-            if !result.map.is_empty() {
+            // The stale-CMap check reads every name that says what its
+            // glyph is — a character, a ligature's letters or nothing —
+            // whether or not any name reads as a single character.
+            if !result.map.is_empty()
+                || !result.sequences.is_empty()
+                || !result.unread_names.is_empty()
+            {
                 identity_overrides = stale_identity_cmap_overrides(doc, font_dict, cmaps, &result);
-                differences = result.map;
             }
+            differences = result.map;
             merge_program_readings(by_index, &mut differences, &mut sequences);
         }
         // Symbol and ZapfDingbats read through their built-in encodings
@@ -1313,20 +1319,62 @@ fn blank_glyph_codes(
     blank
 }
 
-/// Some subset producers change the simple font's glyph encoding but retain
-/// its original ToUnicode. Repair only corroborated ASCII identity entries:
-/// at least three distinct letters move to ASCII slots, their Unicode values remain
-/// elsewhere in the old CMap, and the embedded CFF contains those exact glyphs.
-/// Other repairs need the same evidence, allowing a single-character case
-/// counterpart in the old CMap once the exact matches establish staleness.
-/// Keep repairs per font, since different encodings can share one CMap stream.
+/// Whether a single-byte ToUnicode entry for an ASCII code describes the
+/// slot's original occupant rather than a glyph a later encoding put there:
+/// it maps the code to its own ASCII character, to the mirror image of that
+/// character (`(` at 0x28 mapped to `)`: a CMap written for a right-to-left
+/// line describes the bracket glyph displayed there) or to the
+/// StandardEncoding character of the code (`quoteright` at 0x27).
+fn slot_identity_entry(code: u8, mapped: &str) -> bool {
+    let mut chars = mapped.chars();
+    let (Some(ch), None) = (chars.next(), chars.next()) else {
+        return false;
+    };
+    let slot = code as char;
+    ch == slot
+        || crate::bidi_mirroring::mirrored(slot) == Some(ch)
+        || BaseEncoding::Standard.char_for(code) == Some(ch)
+}
+
+/// Some producers re-encode a simple font's glyphs but keep the original
+/// font's ToUnicode CMap: a re-distilled file gives the glyphs of its Type1C
+/// subsets new codes from 33 upwards, named in `/Differences` (`uni0628.i`,
+/// `uni064A.m`, `five.tnum`), under a CMap laid out for the original codes.
+/// Where a new code lands on a slot the old CMap maps, the CMap wins over
+/// the Differences and the glyph reads as the slot's old occupant — a letter
+/// named `uni0628` at code 0x29 as `(`, a digit named `five` at 0x27 as `’`,
+/// a mark glyph named `arHamzaAboveCCMP` at 0x69 as `i`. Such an entry says
+/// nothing about the glyph ([`slot_identity_entry`]).
+///
+/// The repair needs proof that the CMap is stale: three distinct letters
+/// outside ASCII that the Differences name at such slots and that the old
+/// CMap still maps at other codes; or a CMap written for another set of
+/// codes — most of the codes it maps lie outside the font's own
+/// `FirstChar`..=`LastChar` range, and the names contradict it at the
+/// named slots it does describe. (A current CMap that is merely wider
+/// than the font's use, under a width table that stops short, has the
+/// first mark too; but at the slots both describe it agrees with the
+/// names — `A` at `A`, `a.sc` at `a` — where a stale one contradicts them:
+/// every one of them when it shares few slots with the font, a majority
+/// and three at least when it shares many, so that a couple of odd names
+/// in a wide overlap do not condemn a current CMap.) Every repaired code
+/// must also be a glyph of the embedded Type1C program under the name the
+/// Differences give it. Each
+/// such slot then reads as its name says: a letter outside ASCII, a
+/// no-break space, the letters of a ligature, an ASCII letter or digit
+/// other than the slot's (capitalization alone is no disagreement: `A.sc`
+/// at `a` reads as the CMap wrote it), or nothing at all for a name that spells
+/// no character, so that no stray ASCII letter stands in for a mark glyph.
+/// A font whose CMap agrees with its Differences has no such slot and is
+/// left alone. Repairs are kept per font, since different encodings can
+/// share one CMap stream.
 fn stale_identity_cmap_overrides(
     doc: &Document,
     font_dict: &lopdf::Dictionary,
     cmaps: &FontCMaps,
     encoding: &EncodingResult,
-) -> FontEncodingMap {
-    let verified = || -> Option<FontEncodingMap> {
+) -> HashMap<u8, String> {
+    let verified = || -> Option<HashMap<u8, String>> {
         if font_dict.get(b"Subtype").ok()?.as_name().ok()? != b"Type1" {
             return None;
         }
@@ -1335,35 +1383,104 @@ fn stale_identity_cmap_overrides(
         if entry.primary.code_byte_length != 1 || entry.remapped.is_some() {
             return None;
         }
-        let elsewhere: std::collections::HashSet<String> = (0..=255)
-            .filter_map(|code| entry.primary.lookup(code))
-            .collect();
-        let single_case_match =
-            |case: String| case.chars().count() == 1 && elsewhere.contains(&case);
-        let candidates: FontEncodingMap = encoding
-            .map
+        let mapped = |code: u8| {
+            entry
+                .primary
+                .lookup(u16::from(code))
+                .filter(|text| !text.is_empty() && !text.contains('\u{FFFD}'))
+        };
+        let mapped_codes: Vec<u8> = (0..=255u8).filter(|&code| mapped(code).is_some()).collect();
+        let elsewhere: std::collections::HashSet<String> = mapped_codes
             .iter()
-            .filter_map(|(&code, &ch)| {
-                (code.is_ascii_graphic()
-                    && !ch.is_ascii()
-                    && (ch.is_alphabetic() || ch == '\u{00a0}')
-                    && entry.primary.lookup(code as u16).as_deref()
-                        == Some(&(code as char).to_string())
-                    && (elsewhere.contains(&ch.to_string())
-                        || (ch.is_alphabetic()
-                            && (single_case_match(ch.to_lowercase().to_string())
-                                || single_case_match(ch.to_uppercase().to_string())))))
-                .then_some((code, ch))
-            })
+            .filter_map(|&code| mapped(code))
             .collect();
-        let exact_anchor_count = |map: &FontEncodingMap| {
-            map.values()
-                .copied()
-                .filter(|ch| ch.is_alphabetic() && elsewhere.contains(&ch.to_string()))
-                .collect::<std::collections::HashSet<char>>()
+        // The named ASCII slots the old CMap describes as their own
+        // occupant, and what each of those reads as by its name where the
+        // name says otherwise.
+        let mut described = 0usize;
+        let mut repairs: HashMap<u8, String> = HashMap::new();
+        for &code in &encoding.named_codes {
+            if !code.is_ascii_graphic() {
+                continue;
+            }
+            let Some(old) = mapped(code) else {
+                continue;
+            };
+            if !slot_identity_entry(code, &old) {
+                continue;
+            }
+            described += 1;
+            let reading = if let Some(&ch) = encoding.map.get(&code) {
+                let disagrees = if ch.is_ascii() {
+                    ch.is_ascii_alphanumeric()
+                        && !old.eq_ignore_ascii_case(ch.encode_utf8(&mut [0; 4]))
+                } else {
+                    ch.is_alphabetic() || ch == '\u{00a0}'
+                };
+                if !disagrees {
+                    continue;
+                }
+                ch.to_string()
+            } else if let Some(text) = encoding.sequences.get(&code) {
+                if *text == old {
+                    continue;
+                }
+                text.clone()
+            } else if encoding.unread_names.contains_key(&code) {
+                String::new()
+            } else {
+                continue;
+            };
+            repairs.insert(code, reading);
+        }
+        if repairs.is_empty() {
+            return None;
+        }
+        // Distinct letters outside ASCII whose characters the old CMap maps
+        // at other codes: the glyphs moved, the CMap did not follow.
+        let anchors = |repairs: &HashMap<u8, String>| {
+            repairs
+                .values()
+                .filter(|text| {
+                    let mut chars = text.chars();
+                    matches!(
+                        (chars.next(), chars.next()),
+                        (Some(ch), None) if !ch.is_ascii() && ch.is_alphabetic()
+                    ) && elsewhere.contains(text.as_str())
+                })
+                .collect::<std::collections::HashSet<&String>>()
                 .len()
         };
-        if exact_anchor_count(&candidates) < 3 {
+        let code_bound = |key: &[u8]| -> Option<u16> {
+            match font_dict.get(key).ok()? {
+                Object::Integer(n) => u16::try_from(*n).ok(),
+                Object::Reference(id) => {
+                    u16::try_from(doc.get_object(*id).ok()?.as_i64().ok()?).ok()
+                }
+                _ => None,
+            }
+        };
+        let mostly_elsewhere = match (code_bound(b"FirstChar"), code_bound(b"LastChar")) {
+            (Some(first), Some(last)) if first <= last => {
+                let outside = mapped_codes
+                    .iter()
+                    .filter(|&&code| u16::from(code) < first || u16::from(code) > last)
+                    .count();
+                outside * 2 > mapped_codes.len()
+            }
+            _ => false,
+        };
+        // A CMap written for another set of codes: mostly outside the
+        // font's own, and contradicted by the names at the slots it does
+        // describe — at every one of them, or at a majority and three at
+        // least where the two share many.
+        let foreign = |repairs: &HashMap<u8, String>| {
+            mostly_elsewhere
+                && !repairs.is_empty()
+                && (repairs.len() == described
+                    || (repairs.len() >= 3 && repairs.len() * 2 > described))
+        };
+        if anchors(&repairs) < 3 && !foreign(&repairs) {
             return None;
         }
         let descriptor = resolve_dict(doc, font_dict.get(b"FontDescriptor").ok()?)?;
@@ -1374,16 +1491,14 @@ fn stale_identity_cmap_overrides(
         }
         let data = font_file_data(doc, font_ref)?;
         let cff = ttf_parser::cff::Table::parse(&data)?;
-        let overrides: FontEncodingMap = candidates
-            .into_iter()
-            .filter(|(code, _)| {
-                encoding
-                    .glyph_names
-                    .get(code)
-                    .is_some_and(|name| cff.glyph_index_by_name(name).is_some())
-            })
-            .collect();
-        (exact_anchor_count(&overrides) >= 3).then_some(overrides)
+        repairs.retain(|code, _| {
+            encoding
+                .glyph_names
+                .get(code)
+                .or_else(|| encoding.unread_names.get(code))
+                .is_some_and(|name| cff.glyph_index_by_name(name).is_some())
+        });
+        (foreign(&repairs) || anchors(&repairs) >= 3).then_some(repairs)
     };
     verified().unwrap_or_default()
 }
@@ -1455,7 +1570,12 @@ pub(crate) fn parse_font_encoding(
 /// `/Differences` array, either of which may be absent.
 pub(crate) struct EncodingResult {
     pub map: FontEncodingMap,
+    /// The name each code of `map` and of `sequences` carries.
     glyph_names: HashMap<u8, String>,
+    /// Codes whose name spells no character and numbers no glyph — a mark
+    /// glyph named for the feature that places it (`arHamzaAboveCCMP`): the
+    /// glyph is that name and reads as nothing.
+    unread_names: HashMap<u8, String>,
     /// Character codes whose glyph names are glyph indexes (`gid53`, `g53`,
     /// `glyph53`, `index53`) rather than names. These reference the font
     /// program's glyph table and are decodable only through it or through
@@ -1529,6 +1649,7 @@ pub(crate) fn parse_encoding_dictionary(
 
     let mut encoding_map = FontEncodingMap::new();
     let mut glyph_names = HashMap::new();
+    let mut unread_names = HashMap::new();
     let mut current_code: u8 = 0;
     let mut ligature_count = 0u32;
     let mut gid_codes: Vec<u8> = Vec::new();
@@ -1573,11 +1694,13 @@ pub(crate) fn parse_encoding_dictionary(
                 encoding_map.remove(&current_code);
                 sequences.remove(&current_code);
                 glyph_names.remove(&current_code);
+                unread_names.remove(&current_code);
                 gid_codes.retain(|code| *code != current_code);
                 gid_names.retain(|(code, _)| *code != current_code);
                 // Numbered names (e.g. "gid00053", "g53", "cid53") say
                 // nothing without the font program's glyph table.
-                if mapped.is_none() && numbered_glyph_name(&glyph_name).is_some() {
+                let numbered = mapped.is_none() && numbered_glyph_name(&glyph_name).is_some();
+                if numbered {
                     gid_codes.push(current_code);
                     gid_names.push((current_code, glyph_name.clone()));
                 }
@@ -1592,6 +1715,9 @@ pub(crate) fn parse_encoding_dictionary(
                         "  Differences: code=0x{:02X} glyph={:?} (unmapped)",
                         current_code, glyph_name
                     );
+                    if !numbered {
+                        unread_names.insert(current_code, glyph_name);
+                    }
                 }
                 current_code = current_code.wrapping_add(1);
             }
@@ -1617,6 +1743,7 @@ pub(crate) fn parse_encoding_dictionary(
     Some(EncodingResult {
         map: encoding_map,
         glyph_names,
+        unread_names,
         gid_codes,
         gid_names,
         named_codes,
@@ -2034,6 +2161,42 @@ fn font_file_data(doc: &Document, ff_ref: ObjectId) -> Option<Vec<u8>> {
     )
 }
 
+/// One reading of a string through a two-byte CMap: the text, the number
+/// of codes that contributed to it, and the CMap it came through.
+struct CidDecode<'a> {
+    text: String,
+    codes: usize,
+    cmap: &'a crate::tounicode::ToUnicodeCMap,
+}
+
+impl<'a> CidDecode<'a> {
+    fn new(cmap: &'a crate::tounicode::ToUnicodeCMap, bytes: &[u8]) -> Self {
+        let (text, codes) = cmap.decode_cids_with(bytes, |out, label| out.push_str(label));
+        Self { text, codes, cmap }
+    }
+
+    /// The text, with the characters one code reads as joined
+    /// (`bidi::push_glyph_characters`) where the string holds right-to-left
+    /// text and some code read as several characters: the string is then
+    /// decoded once more through the same CMap, the same way, with the
+    /// joining appender, so the joins fall on that CMap's own code
+    /// boundaries. A code contributes one label or nothing, so a text with
+    /// exactly as many characters as codes that contributed to it is one
+    /// character per code, and there is nothing to join.
+    fn joined(self, bytes: &[u8]) -> String {
+        if self.text.chars().count() == self.codes
+            || !self.text.chars().any(crate::text_utils::is_rtl_char)
+        {
+            return self.text;
+        }
+        self.cmap
+            .decode_cids_with(bytes, |out, label| {
+                crate::bidi::push_glyph_characters(out, label)
+            })
+            .0
+    }
+}
+
 /// Decode a PDF string and record whether legacy symbol cleanup changed a character.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_text_from_operand(
@@ -2066,12 +2229,19 @@ pub(crate) fn extract_text_from_operand(
                         // 1. Primary CMap
                         if let Some(s) = entry.primary.lookup(code) {
                             if !s.contains('\u{FFFD}') {
-                                if s == (b as char).to_string() {
-                                    if let Some(&ch) =
-                                        encoding_map.and_then(|map| map.identity_overrides.get(&b))
-                                    {
-                                        return Some(ch.to_string());
+                                // An entry of a stale CMap that describes
+                                // the slot rather than the glyph reads as
+                                // the font's own Differences say — a
+                                // character, a ligature's letters, or
+                                // nothing (see `stale_identity_cmap_overrides`).
+                                if let Some(text) =
+                                    encoding_map.and_then(|map| map.identity_overrides.get(&b))
+                                {
+                                    if slot_identity_entry(b, &s) {
+                                        return (!text.is_empty()).then(|| text.clone());
                                     }
+                                }
+                                if s == (b as char).to_string() {
                                     // A CMap that maps a code to itself says
                                     // nothing a Differences ligature name at
                                     // that code does not say better.
@@ -2126,18 +2296,19 @@ pub(crate) fn extract_text_from_operand(
                         }
                         None
                     };
-                    let decoded: String = bytes
-                        .iter()
-                        .filter_map(|&b| {
-                            let label = decode_byte(b)?;
-                            // A glyph with no outline paints a gap, whatever
-                            // its label says.
-                            if blank_glyph_reads_as_space(encoding_map, b, &label) {
-                                return Some(" ".to_string());
-                            }
-                            Some(label)
-                        })
-                        .collect();
+                    let mut decoded = String::new();
+                    for &b in bytes {
+                        let Some(label) = decode_byte(b) else {
+                            continue;
+                        };
+                        // A glyph with no outline paints a gap, whatever
+                        // its label says.
+                        if blank_glyph_reads_as_space(encoding_map, b, &label) {
+                            decoded.push(' ');
+                        } else {
+                            crate::bidi::push_glyph_characters(&mut decoded, &label);
+                        }
+                    }
                     if !decoded.is_empty() {
                         return Some(decoded);
                     }
@@ -2148,65 +2319,69 @@ pub(crate) fn extract_text_from_operand(
                 if bytes.len() % 2 == 1 {
                     // Some PDFs emit 1-byte codes even for Type0 fonts; try per-byte lookup
                     let lookups = entry.primary.lookup_bytes(bytes);
-                    let decoded: String = lookups
-                        .iter()
-                        .filter_map(|&(_b, ref cmap_result)| cmap_result.clone())
-                        .collect();
+                    let mut decoded = String::new();
+                    for (_, cmap_result) in &lookups {
+                        if let Some(label) = cmap_result {
+                            crate::bidi::push_glyph_characters(&mut decoded, label);
+                        }
+                    }
                     if !decoded.is_empty() {
                         return Some(decoded);
                     }
                 }
-                let decoded_primary = entry.primary.decode_cids(bytes);
+                // Each reading keeps the CMap it came through, so the one
+                // taken joins the characters of its codes by that CMap's own
+                // code boundaries (see `CidDecode::joined`).
+                let key = font_tounicode_refs.get(current_font).copied().unwrap_or(0);
+                let primary = CidDecode::new(&entry.primary, bytes);
                 if let Some(remapped) = entry.remapped.as_ref() {
-                    let decoded_remap = remapped.decode_cids(bytes);
-                    let decoded_fallback = entry.fallback.as_ref().map(|c| c.decode_cids(bytes));
+                    let remap = CidDecode::new(remapped, bytes);
+                    let fallback = entry.fallback.as_ref().map(|c| CidDecode::new(c, bytes));
 
-                    if let Some(choice) = cmap_decisions
-                        .get_choice(font_tounicode_refs.get(current_font).copied().unwrap_or(0))
-                    {
-                        let decoded = match choice {
-                            CMapChoice::Primary => decoded_primary.clone(),
-                            CMapChoice::Remapped => decoded_remap.clone(),
+                    if let Some(choice) = cmap_decisions.get_choice(key) {
+                        let chosen = match choice {
+                            CMapChoice::Primary => &primary,
+                            CMapChoice::Remapped => &remap,
                         };
-                        if !decoded.is_empty() {
-                            return Some(decoded);
+                        if !chosen.text.is_empty() {
+                            let chosen = match choice {
+                                CMapChoice::Primary => primary,
+                                CMapChoice::Remapped => remap,
+                            };
+                            return Some(chosen.joined(bytes));
                         }
                     }
 
-                    let choice = cmap_decisions.consider(
-                        font_tounicode_refs.get(current_font).copied().unwrap_or(0),
-                        &decoded_primary,
-                        &decoded_remap,
-                        bytes.len(),
-                    );
+                    let choice =
+                        cmap_decisions.consider(key, &primary.text, &remap.text, bytes.len());
                     let mut decoded = match choice {
-                        Some(CMapChoice::Primary) => decoded_primary,
-                        Some(CMapChoice::Remapped) => decoded_remap,
-                        None => choose_best_cmap_decode(decoded_primary, decoded_remap),
+                        Some(CMapChoice::Primary) => primary,
+                        Some(CMapChoice::Remapped) => remap,
+                        None => choose_best_cmap_decode(primary, remap),
                     };
-                    if let Some(fb) = decoded_fallback {
+                    if let Some(fb) = fallback {
                         let expected = bytes.len() / 2;
-                        let decoded_len = decoded.chars().count();
-                        let prefer_fallback = (!fb.is_empty() && decoded.is_empty())
-                            || (!fb.is_empty() && expected > 0 && decoded_len * 2 < expected);
-                        if prefer_fallback || score_text(&fb) > score_text(&decoded) + 3 {
+                        let decoded_len = decoded.text.chars().count();
+                        let prefer_fallback = (!fb.text.is_empty() && decoded.text.is_empty())
+                            || (!fb.text.is_empty() && expected > 0 && decoded_len * 2 < expected);
+                        if prefer_fallback || score_text(&fb.text) > score_text(&decoded.text) + 3 {
                             decoded = fb;
                         }
                     }
-                    if !decoded.is_empty() {
-                        return Some(decoded);
+                    if !decoded.text.is_empty() {
+                        return Some(decoded.joined(bytes));
                     }
-                } else if !decoded_primary.is_empty() {
-                    if let Some(fb) = entry.fallback.as_ref().map(|c| c.decode_cids(bytes)) {
+                } else if !primary.text.is_empty() {
+                    if let Some(fb) = entry.fallback.as_ref().map(|c| CidDecode::new(c, bytes)) {
                         let expected = bytes.len() / 2;
-                        let decoded_len = decoded_primary.chars().count();
-                        let prefer_fallback = (!fb.is_empty() && decoded_primary.is_empty())
-                            || (!fb.is_empty() && expected > 0 && decoded_len * 2 < expected);
-                        if prefer_fallback || score_text(&fb) > score_text(&decoded_primary) + 3 {
-                            return Some(fb);
+                        let decoded_len = primary.text.chars().count();
+                        let prefer_fallback = (!fb.text.is_empty() && primary.text.is_empty())
+                            || (!fb.text.is_empty() && expected > 0 && decoded_len * 2 < expected);
+                        if prefer_fallback || score_text(&fb.text) > score_text(&primary.text) + 3 {
+                            return Some(fb.joined(bytes));
                         }
                     }
-                    return Some(decoded_primary);
+                    return Some(primary.joined(bytes));
                 }
 
                 None
@@ -2295,7 +2470,10 @@ pub(crate) fn extract_text_from_operand(
                             }
                             Some(label)
                         })
-                        .collect();
+                        .fold(String::new(), |mut decoded, label| {
+                            crate::bidi::push_glyph_characters(&mut decoded, &label);
+                            decoded
+                        });
                     if !decoded.is_empty() {
                         return Some(decoded);
                     }
@@ -2593,15 +2771,15 @@ fn decode_symbol_fallback(bytes: &[u8], base_font_name: Option<&str>) -> Option<
     }
 }
 
-fn choose_best_cmap_decode(primary: String, remapped: String) -> String {
-    if primary.is_empty() {
+fn choose_best_cmap_decode<'a>(primary: CidDecode<'a>, remapped: CidDecode<'a>) -> CidDecode<'a> {
+    if primary.text.is_empty() {
         return remapped;
     }
-    if remapped.is_empty() {
+    if remapped.text.is_empty() {
         return primary;
     }
-    let score_primary = score_text(&primary);
-    let score_remap = score_text(&remapped);
+    let score_primary = score_text(&primary.text);
+    let score_remap = score_text(&remapped.text);
     if score_remap > score_primary + 3 {
         remapped
     } else {
@@ -2714,7 +2892,7 @@ mod tests {
             "F0".to_string(),
             FontEncoding {
                 differences: FontEncodingMap::new(),
-                identity_overrides: FontEncodingMap::new(),
+                identity_overrides: HashMap::new(),
                 blank_codes: Default::default(),
                 base: Some(BaseEncoding::WinAnsi),
                 named_codes: Default::default(),
@@ -2739,6 +2917,78 @@ mod tests {
         )
         .expect("text decoded");
         assert_eq!(text, "AB");
+    }
+
+    #[test]
+    fn two_byte_codes_reading_as_several_right_to_left_characters_are_joined() {
+        use crate::bidi::GLYPH_JOINER;
+        use crate::tounicode::{CMapEntry, ToUnicodeCMap};
+        let cmap = |entries: &[(u16, &str)]| {
+            let mut cmap = ToUnicodeCMap {
+                code_byte_length: 2,
+                ..Default::default()
+            };
+            for &(cid, text) in entries {
+                cmap.char_map.insert(cid, text.to_string());
+            }
+            cmap
+        };
+        let decode = |entry: CMapEntry, decisions: &mut CMapDecisionCache, bytes: Vec<u8>| {
+            let mut inline_cmaps = HashMap::new();
+            inline_cmaps.insert("F0".to_string(), entry);
+            extract_text_from_operand(
+                &Object::String(bytes, lopdf::StringFormat::Literal),
+                "F0",
+                None,
+                &FontCMaps::default(),
+                &HashMap::new(),
+                &inline_cmaps,
+                &HashMap::new(),
+                &HashMap::new(),
+                decisions,
+                &HashMap::new(),
+            )
+            .map(|(text, _)| text)
+        };
+        // A CID mapped to two letters (a lam-alef ligature) beside a CID
+        // mapped to one: the letters of the one glyph are joined, the
+        // single letter is not, and a string without right-to-left text is
+        // left as it is.
+        let single = || CMapEntry {
+            primary: cmap(&[(1, "\u{0644}\u{0627}"), (2, "\u{0647}"), (3, "fi")]),
+            remapped: None,
+            fallback: None,
+        };
+        assert_eq!(
+            decode(single(), &mut CMapDecisionCache::new(), vec![0, 2, 0, 1]).as_deref(),
+            Some(&*format!("\u{0647}\u{0644}{GLYPH_JOINER}\u{0627}"))
+        );
+        assert_eq!(
+            decode(single(), &mut CMapDecisionCache::new(), vec![0, 3, 0, 3]).as_deref(),
+            Some("fifi")
+        );
+        // Two CMaps reading a string as the same letters cut at different
+        // codes: the joins follow the CMap the string is read through.
+        let either = || CMapEntry {
+            primary: cmap(&[(1, "\u{0644}"), (2, "\u{0627}\u{0647}")]),
+            remapped: Some(cmap(&[(1, "\u{0644}\u{0627}"), (2, "\u{0647}")])),
+            fallback: None,
+        };
+        let english = "the and of to in a is that for with on as by from this be are at or not";
+        let mut prefers_remapped = CMapDecisionCache::new();
+        prefers_remapped.consider(0, "", english, 240);
+        assert_eq!(prefers_remapped.get_choice(0), Some(CMapChoice::Remapped));
+        assert_eq!(
+            decode(either(), &mut prefers_remapped, vec![0, 1, 0, 2]).as_deref(),
+            Some(&*format!("\u{0644}{GLYPH_JOINER}\u{0627}\u{0647}"))
+        );
+        let mut prefers_primary = CMapDecisionCache::new();
+        prefers_primary.consider(0, english, "", 240);
+        assert_eq!(prefers_primary.get_choice(0), Some(CMapChoice::Primary));
+        assert_eq!(
+            decode(either(), &mut prefers_primary, vec![0, 1, 0, 2]).as_deref(),
+            Some(&*format!("\u{0644}\u{0627}{GLYPH_JOINER}\u{0647}"))
+        );
     }
 
     #[test]
@@ -2798,7 +3048,7 @@ mod tests {
             "F0".to_string(),
             FontEncoding {
                 differences: FontEncodingMap::new(),
-                identity_overrides: FontEncodingMap::new(),
+                identity_overrides: HashMap::new(),
                 blank_codes: Default::default(),
                 base: None,
                 named_codes: [0x81, 0x82, 0x9B].into_iter().collect(),
@@ -2868,7 +3118,7 @@ mod tests {
             "F0".to_string(),
             FontEncoding {
                 differences: result.map.clone(),
-                identity_overrides: FontEncodingMap::new(),
+                identity_overrides: HashMap::new(),
                 blank_codes: Default::default(),
                 base: Some(BaseEncoding::WinAnsi),
                 named_codes: result.named_codes.clone(),
@@ -3153,7 +3403,7 @@ mod tests {
             "F0".to_string(),
             FontEncoding {
                 differences: FontEncodingMap::new(),
-                identity_overrides: FontEncodingMap::new(),
+                identity_overrides: HashMap::new(),
                 blank_codes: Default::default(),
                 base: Some(BaseEncoding::WinAnsi),
                 named_codes: [0x81].into_iter().collect(),
