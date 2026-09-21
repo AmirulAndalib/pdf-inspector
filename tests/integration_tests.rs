@@ -28,23 +28,29 @@ use pdf_inspector::{
 };
 use std::collections::HashSet;
 
+/// The `/F1` font object of the PDFs the builders below write unless told
+/// otherwise: Helvetica under its standard encoding.
+const HELVETICA_FONT: &str = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
+
 fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
     make_text_pdf_with_boxes(content, media_box, None)
 }
 
 /// Like [`make_text_pdf`], optionally declaring a `/CropBox` on the page.
 fn make_text_pdf_with_boxes(content: &str, media_box: &str, crop_box: Option<&str>) -> Vec<u8> {
-    make_text_pdf_with_rotate(content, media_box, crop_box, None, None)
+    make_text_pdf_with_rotate(content, media_box, crop_box, None, None, HELVETICA_FONT)
 }
 
 /// Like [`make_text_pdf_with_boxes`], optionally declaring a `/Rotate` on
-/// the page (`page_rotate`) and on the `/Pages` node (`pages_rotate`).
+/// the page (`page_rotate`) and on the `/Pages` node (`pages_rotate`), with
+/// `font_body` as the `/F1` font object.
 fn make_text_pdf_with_rotate(
     content: &str,
     media_box: &str,
     crop_box: Option<&str>,
     page_rotate: Option<i64>,
     pages_rotate: Option<i64>,
+    font_body: &str,
 ) -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];
@@ -96,12 +102,7 @@ fn make_text_pdf_with_rotate(
             content
         ),
     );
-    add_object(
-        &mut pdf,
-        &mut offsets,
-        5,
-        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-    );
+    add_object(&mut pdf, &mut offsets, 5, font_body);
 
     let xref_start = pdf.len();
     pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
@@ -6014,7 +6015,8 @@ fn test_display_frame_renders_bottom_to_top_text_under_rotate_90() {
     // first: a page laid out sideways that `/Rotate 90` displays upright.
     let content = "BT /F1 12 Tf 0 1 -1 0 40 420 Tm (HELLO) Tj ET\n\
 BT /F1 12 Tf 0 1 -1 0 70 420 Tm (WORLD) Tj ET";
-    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(90), None);
+    let buf =
+        make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(90), None, HELVETICA_FONT);
 
     // The sheet frame turns the page so the runs read along +x ...
     let (sheet, rotations) = extract_text_with_positions_and_rotations_mem(&buf).unwrap();
@@ -6065,7 +6067,14 @@ BT /F1 12 Tf 0 1 -1 0 70 420 Tm (WORLD) Tj ET";
 fn test_display_frame_renders_top_to_bottom_text_under_rotate_270() {
     let content = "BT /F1 12 Tf 0 -1 1 0 300 700 Tm (HELLO) Tj ET\n\
 BT /F1 12 Tf 0 -1 1 0 270 700 Tm (SECOND) Tj ET";
-    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(270), None);
+    let buf = make_text_pdf_with_rotate(
+        content,
+        "0 0 612 792",
+        None,
+        Some(270),
+        None,
+        HELVETICA_FONT,
+    );
     let (display, rotations) =
         extract_text_with_positions_and_rotations_mem_in_frame(&buf, None, PositionFrame::Display)
             .unwrap();
@@ -6099,7 +6108,14 @@ BT /F1 12 Tf 0 -1 1 0 270 700 Tm (SECOND) Tj ET";
 fn test_display_frame_turns_upright_text_by_an_inherited_rotate() {
     let content = "BT /F1 12 Tf 72 700 Td (Anchor) Tj ET\nBT /F1 12 Tf 72 680 Td (Second) Tj ET";
     // `/Rotate 180` on the /Pages node only.
-    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, None, Some(180));
+    let buf = make_text_pdf_with_rotate(
+        content,
+        "0 0 612 792",
+        None,
+        None,
+        Some(180),
+        HELVETICA_FONT,
+    );
     let sheet = extract_text_with_positions_mem(&buf).unwrap();
     let anchor_sheet = find_item(&sheet, "Anchor");
     assert_eq!((anchor_sheet.x, anchor_sheet.y), (72.0, 700.0));
@@ -6121,7 +6137,14 @@ fn test_display_frame_turns_upright_text_by_an_inherited_rotate() {
     );
 
     // The page's own /Rotate wins over the inherited one.
-    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(90), Some(180));
+    let buf = make_text_pdf_with_rotate(
+        content,
+        "0 0 612 792",
+        None,
+        Some(90),
+        Some(180),
+        HELVETICA_FONT,
+    );
     let anchor = find_item(&display_items(&buf), "Anchor").clone();
     assert_close(anchor.x, 700.0);
     assert_close(anchor.y, 612.0 - 72.0 - anchor_sheet.width);
@@ -6130,7 +6153,14 @@ fn test_display_frame_turns_upright_text_by_an_inherited_rotate() {
     assert_eq!(anchor.rotation, 270.0);
 
     // A negative angle folds the way renderers fold it: -90 is 270.
-    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(-90), None);
+    let buf = make_text_pdf_with_rotate(
+        content,
+        "0 0 612 792",
+        None,
+        Some(-90),
+        None,
+        HELVETICA_FONT,
+    );
     let anchor = find_item(&display_items(&buf), "Anchor").clone();
     assert_close(anchor.x, 792.0 - 700.0 - 12.0);
     assert_close(anchor.y, 72.0);
@@ -6149,6 +6179,7 @@ fn test_display_frame_with_an_offset_cropbox_under_rotate_90() {
         Some("50 60 350 460"),
         Some(90),
         None,
+        HELVETICA_FONT,
     );
     let sheet = extract_text_with_positions_mem(&buf).unwrap();
     let glyph_sheet = find_item(&sheet, "Visible glyph");
@@ -6183,7 +6214,8 @@ BT /F1 12 Tf 330 680 Td (1.50) Tj ET\n\
 BT /F1 12 Tf 72 660 Td (Pear) Tj ET\n\
 BT /F1 12 Tf 200 660 Td (5) Tj ET\n\
 BT /F1 12 Tf 330 660 Td (2.25) Tj ET";
-    let buf = make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(90), None);
+    let buf =
+        make_text_pdf_with_rotate(content, "0 0 612 792", None, Some(90), None, HELVETICA_FONT);
     let sheet_rect = [60.0, 80.0, 400.0, 137.0];
     // The same area on the 792 x 612 rendered page.
     let display_rect = [792.0 - 137.0, 60.0, 792.0 - 80.0, 400.0];
@@ -7612,4 +7644,110 @@ fn test_cid_text_next_to_vector_art_is_extracted_not_routed_to_ocr() {
     let soup = process_pdf_mem(&make_vector_art_with_caption_pdf()).unwrap();
     assert_eq!(soup.pages_needing_ocr, vec![1]);
     assert_eq!(vector_text_reasons(&soup), vec![1]);
+}
+
+const MAC_ROMAN_HELVETICA: &str =
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /MacRomanEncoding >>";
+
+/// An accented letter set as three text objects: the run up to the letter,
+/// one glyph of a spacing accent (`macron`, code 0xF8 of MacRomanEncoding)
+/// placed by its own text matrix over the letter, and the run from the
+/// letter on. The accent's origin lies a fraction of a point right of the
+/// run it decorates and a little above its baseline; sorted along the
+/// baseline it would come out after that run as a stray "¯". The letter
+/// reads composed instead, in the positioned items and in the Markdown.
+#[test]
+fn detached_spacing_accent_composes_with_the_letter_under_it() {
+    // Helvetica at 10 pt: "The T" runs from x 72 to 98.12, so the rest of
+    // the word starts there; the macron (advance 3.33) is centred over the
+    // "o" (advance 5.56).
+    let content = "BT /F1 10 Tf 1 0 0 1 72 700 Tm (The T) Tj ET\n\
+                   BT /F1 10 Tf 1 0 0 1 99.24 700.14 Tm (\\370) Tj ET\n\
+                   BT /F1 10 Tf 1 0 0 1 98.12 700 Tm (ohoku region) Tj ET";
+    let pdf = make_text_pdf_with_rotate(
+        content,
+        "0 0 612 792",
+        None,
+        None,
+        None,
+        MAC_ROMAN_HELVETICA,
+    );
+
+    let items = extract_text_with_positions_mem(&pdf).expect("extract positioned text");
+    let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+    assert!(texts.contains(&"The T\u{014D}hoku region"), "{texts:?}");
+    assert!(
+        !texts.iter().any(|text| text.contains('\u{00AF}')),
+        "{texts:?}"
+    );
+
+    let markdown = process_pdf_mem(&pdf)
+        .expect("convert PDF to markdown")
+        .markdown
+        .expect("markdown output");
+    assert!(markdown.contains("The T\u{014D}hoku region"), "{markdown}");
+    assert!(!markdown.contains('\u{00AF}'), "{markdown}");
+}
+
+/// A spacing accent that stands over no letter is text of its own and stays
+/// as shown: a grave (code 0x60 of MacRomanEncoding) whose advance follows
+/// an "a" exactly and precedes a "b", and one a word gap away from both.
+/// Neither turns its neighbour into "à".
+#[test]
+fn spacing_accent_beside_letters_stays_as_shown() {
+    let content = "BT /F1 10 Tf 1 0 0 1 72 700 Tm (a) Tj ET\n\
+                   BT /F1 10 Tf 1 0 0 1 77.56 700 Tm (\\140) Tj ET\n\
+                   BT /F1 10 Tf 1 0 0 1 80.89 700 Tm (b) Tj ET\n\
+                   BT /F1 10 Tf 1 0 0 1 72 680 Tm (x = a) Tj ET\n\
+                   BT /F1 10 Tf 1 0 0 1 96.5 680 Tm (\\140) Tj ET\n\
+                   BT /F1 10 Tf 1 0 0 1 102.5 680 Tm (b) Tj ET";
+    let pdf = make_text_pdf_with_rotate(
+        content,
+        "0 0 612 792",
+        None,
+        None,
+        None,
+        MAC_ROMAN_HELVETICA,
+    );
+
+    let items = extract_text_with_positions_mem(&pdf).expect("extract positioned text");
+    let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+    assert!(texts.contains(&"a\u{0060}b"), "{texts:?}");
+    assert!(texts.contains(&"x = a \u{0060} b"), "{texts:?}");
+    assert!(
+        !texts.iter().any(|text| text.contains('\u{00E0}')),
+        "{texts:?}"
+    );
+}
+
+/// A run whose text is a producer's ActualText replacement carries no
+/// glyph-by-glyph text: an accent over its first painted glyph is left as
+/// shown rather than composed with the replacement's first character.
+#[test]
+fn spacing_accent_over_a_replacement_text_span_stays_as_shown() {
+    // `Real` replaces the painted `Fake`; the acute (code 0xAB of
+    // MacRomanEncoding) is centred over the painted F.
+    let content =
+        "BT /F1 10 Tf 1 0 0 1 72 700 Tm /Span << /ActualText (Real) >> BDC (Fake) Tj EMC ET\n\
+                   BT /F1 10 Tf 1 0 0 1 73.39 700.14 Tm (\\253) Tj ET";
+    let pdf = make_text_pdf_with_rotate(
+        content,
+        "0 0 612 792",
+        None,
+        None,
+        None,
+        MAC_ROMAN_HELVETICA,
+    );
+
+    let items = extract_text_with_positions_mem(&pdf).expect("extract positioned text");
+    let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+    assert!(texts.contains(&"Real"), "{texts:?}");
+    assert!(
+        texts.iter().any(|text| text.contains('\u{00B4}')),
+        "{texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|text| text.contains('\u{0154}')),
+        "{texts:?}"
+    );
 }
