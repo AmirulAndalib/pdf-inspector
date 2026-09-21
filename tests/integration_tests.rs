@@ -7751,3 +7751,242 @@ fn spacing_accent_over_a_replacement_text_span_stays_as_shown() {
         "{texts:?}"
     );
 }
+
+/// The six glyphs CIDs 1 to 6 of [`make_zero_advance_sign_pdf`] decode to:
+/// a word of a script whose subscript letters and vowel signs have zero
+/// advance.
+const SIGNED_WORD: &str = "\u{1789}\u{17D2}\u{1789}\u{179C}\u{178F}\u{17D2}\u{1790}\u{17BB}";
+
+/// A page showing `text` through `F1`, a Type0/Identity-H font without a
+/// program whose `/W` gives CIDs 1 to 7 the advances 958, 0, 344, 825, 0, 0
+/// and 276 — CIDs 2, 5 and 6 are a subscript letter and two vowel signs of
+/// a script whose signs have zero advance — with a ToUnicode CMap that maps
+/// CIDs 1 and 4 to a letter plus the sign that makes the letter after it a
+/// subscript. With `in_form` a Form XObject the page invokes shows the text.
+fn make_zero_advance_sign_pdf(text: &str, in_form: bool) -> Vec<u8> {
+    make_cid_font_pdf(
+        &[958, 0, 344, 825, 0, 0, 276],
+        &[
+            (1, "178917D2"),
+            (2, "1789"),
+            (3, "179C"),
+            (4, "178F17D2"),
+            (5, "1790"),
+            (6, "17BB"),
+        ],
+        text,
+        in_form,
+    )
+}
+
+/// A page showing `content` through `F1`, a Type0/Identity-H font without
+/// a program whose `/W` gives CIDs from 1 the advances in `widths` and
+/// whose ToUnicode CMap maps each CID of `cmap_entries` to the code points
+/// given as hex. With `in_form` a Form XObject the page invokes shows the
+/// content.
+fn make_cid_font_pdf(
+    widths: &[i64],
+    cmap_entries: &[(u16, &str)],
+    content: &str,
+    in_form: bool,
+) -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+         /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+         1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+    );
+    cmap.push_str(&format!("{} beginbfchar\n", cmap_entries.len()));
+    for (cid, code_points) in cmap_entries {
+        cmap.push_str(&format!("<{cid:04X}> <{code_points}>\n"));
+    }
+    cmap.push_str("endbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+    let text = content;
+
+    let mut doc = Document::with_version("1.5");
+    let descriptor_id = doc.add_object(dictionary! {
+        "Type" => "FontDescriptor",
+        "FontName" => "AAAAAA+Signs",
+        "Flags" => 4,
+        "FontBBox" => vec![Object::Integer(-100), Object::Integer(-300), 1000.into(), 900.into()],
+        "ItalicAngle" => 0,
+        "Ascent" => 900,
+        "Descent" => Object::Integer(-300),
+        "CapHeight" => 700,
+        "StemV" => 80,
+    });
+    let widths: Vec<Object> = widths.iter().map(|&width| Object::Integer(width)).collect();
+    let cid_font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "CIDFontType2",
+        "BaseFont" => "AAAAAA+Signs",
+        "CIDSystemInfo" => dictionary! {
+            "Registry" => Object::string_literal("Adobe"),
+            "Ordering" => Object::string_literal("Identity"),
+            "Supplement" => 0,
+        },
+        "FontDescriptor" => descriptor_id,
+        "DW" => 1000,
+        "W" => vec![1.into(), Object::Array(widths)],
+        "CIDToGIDMap" => "Identity",
+    });
+    let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type0",
+        "BaseFont" => "AAAAAA+Signs",
+        "Encoding" => "Identity-H",
+        "DescendantFonts" => vec![cid_font_id.into()],
+        "ToUnicode" => cmap_id,
+    });
+    let mut resources = dictionary! {
+        "Font" => dictionary! { "F1" => font_id },
+    };
+    let content = if in_form {
+        let form_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            },
+            text.as_bytes().to_vec(),
+        ));
+        resources.set("XObject", dictionary! { "Fm1" => form_id });
+        "q /Fm1 Do Q\n".to_string()
+    } else {
+        text.to_string()
+    };
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => resources,
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// A dependent sign that its font gives no advance, placed over the glyph
+/// before it with a backward `TJ` offset and the pen returned with a
+/// forward one, is no word gap: the return only brings the pen back to
+/// where it had been. Nor does such a sign open a gap when every glyph is
+/// shown from its own `Tm`. A forward offset from the pen's farthest point,
+/// and the part of a return that carries past it, are word gaps as ever.
+#[test]
+fn test_zero_advance_signs_placed_behind_the_pen_open_no_word_gaps() {
+    const TJ_WORD: &str = "BT /F1 14 Tf 20 700 Td [<0001> 223 <0002> -221 <0003> <0004> 246 <0005> -221 <0006>] TJ ET";
+    let glyph_per_op: String = [20.0, 30.28, 33.41, 38.23, 46.33, 49.78]
+        .iter()
+        .enumerate()
+        .map(|(index, x)| {
+            format!(
+                "BT /F1 14 Tf 1 0 0 1 {x} 700 Tm <{:04X}> Tj ET\n",
+                index + 1
+            )
+        })
+        .collect();
+    for in_form in [false, true] {
+        for content in [TJ_WORD, glyph_per_op.as_str()] {
+            let pdf = make_zero_advance_sign_pdf(content, in_form);
+            let items = extract_text_with_positions_mem(&pdf).unwrap();
+            let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+            assert_eq!(texts, [SIGNED_WORD], "in_form={in_form}: {content}");
+            let pages = extract_pages_markdown_mem(&pdf, None).unwrap();
+            let markdown = &pages.pages[0].markdown;
+            assert!(
+                markdown.contains(SIGNED_WORD),
+                "in_form={in_form}: {content}: {markdown:?}"
+            );
+        }
+    }
+
+    for (content, expected) in [
+        (
+            "BT /F1 14 Tf 20 700 Td [<0002> -600 <0003>] TJ ET",
+            "\u{1789} \u{179C}",
+        ),
+        (
+            "BT /F1 14 Tf 20 700 Td [<0001> 223 <0002> -621 <0003>] TJ ET",
+            "\u{1789}\u{17D2}\u{1789} \u{179C}",
+        ),
+    ] {
+        let pdf = make_zero_advance_sign_pdf(content, false);
+        let pages = extract_pages_markdown_mem(&pdf, None).unwrap();
+        let markdown = &pages.pages[0].markdown;
+        assert!(markdown.contains(expected), "{content}: {markdown:?}");
+    }
+}
+
+/// A vowel sign that its font gives no advance, on a right-to-left line.
+/// Placed by a backward `TJ` offset behind the pen inside a word painted
+/// in visual order, it opens no word gap and stays on its letter once the
+/// line is read back into logical order; shown as a glyph of its own by a
+/// producer walking the line right to left, it follows its letter in the
+/// reading instead of the letter read before it, and the word gap after
+/// its word is measured from the letter, not from the sign.
+#[test]
+fn test_zero_advance_sign_on_a_right_to_left_line_stays_on_its_letter() {
+    const POINTED_LINE: &str = "\u{05D1}\u{05D0}\u{05B8}\u{05DC} \u{05E9}\u{05DC}\u{05D5}\u{05DD}";
+    // Two words in visual order, painted left to right: the second word's
+    // display, then the first's, with the sign placed 0.3 em back over the
+    // second letter and the pen returned.
+    let visual_words = "BT /F1 12 Tf 100 700 Td [<0007> <0006> <0004> <0005>] TJ ET\n\
+                        BT /F1 12 Tf 129 700 Td [<0004> <0002> 300 <0003> -300 <0001>] TJ ET\n";
+    // The same line one glyph per operator, walked right to left.
+    let glyph_per_op: String = [
+        (1, 141.0),
+        (2, 135.0),
+        (3, 137.4),
+        (4, 129.0),
+        (5, 118.0),
+        (4, 112.0),
+        (6, 106.0),
+        (7, 100.0),
+    ]
+    .iter()
+    .map(|(cid, x)| format!("BT /F1 12 Tf 1 0 0 1 {x} 700 Tm <{cid:04X}> Tj ET\n"))
+    .collect();
+    for content in [visual_words, glyph_per_op.as_str()] {
+        let pdf = make_cid_font_pdf(
+            &[500, 500, 0, 500, 500, 500, 500],
+            &[
+                (1, "05D1"),
+                (2, "05D0"),
+                (3, "05B8"),
+                (4, "05DC"),
+                (5, "05E9"),
+                (6, "05D5"),
+                (7, "05DD"),
+            ],
+            content,
+            false,
+        );
+        let items = extract_text_with_positions_mem(&pdf).unwrap();
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, [POINTED_LINE], "{content}");
+        let pages = extract_pages_markdown_mem(&pdf, None).unwrap();
+        let markdown = &pages.pages[0].markdown;
+        assert!(markdown.contains(POINTED_LINE), "{content}: {markdown:?}");
+    }
+}

@@ -1053,6 +1053,61 @@ fn effective_merge_width(item: &TextItem) -> f32 {
     }
 }
 
+/// Width, as a share of the font size, under which a measured run is a
+/// glyph without advance.
+const ZERO_WIDTH_MARK_EM: f32 = 0.01;
+
+/// Most characters a dependent sign shown as a run of its own decodes to:
+/// a sign, or one that decodes to two code points. A longer run without
+/// advance is hidden text, not a sign.
+const ZERO_WIDTH_MARK_MAX_CHARS: usize = 2;
+
+/// Whether `item` is a dependent sign shown as a run of its own: a glyph
+/// without advance — a vowel sign, a subscript letter, an accent — by its
+/// measured width, or a run of nothing but combining marks, of a character
+/// or two either way. Such a sign is drawn over the glyph before it, behind
+/// the pen, and the line's right edge does not move for it.
+fn is_zero_width_mark(item: &TextItem) -> bool {
+    let text = item.text.trim();
+    if !(1..=ZERO_WIDTH_MARK_MAX_CHARS).contains(&text.chars().count())
+        || !matches!(item.item_type, crate::types::ItemType::Text)
+    {
+        return false;
+    }
+    (item.advance_known && item.width.abs() <= item.font_size.abs() * ZERO_WIDTH_MARK_EM)
+        || text.chars().all(crate::bidi::is_combining_mark)
+}
+
+/// Whether `x` lies inside the advance of `item`: from its origin to short
+/// of its end, whichever way it reads.
+fn inside_advance(item: &TextItem, x: f32) -> bool {
+    let end = item.x + item.width;
+    x >= item.x.min(end) && x < item.x.max(end)
+}
+
+/// Sort a line's fragments along +x, keeping a dependent sign right after
+/// the base it was shown on. A zero-width sign whose origin lies inside
+/// the advance of the fragment shown before it — over that fragment, short
+/// of its end — takes that fragment's x as its key and follows it; by its
+/// own x it would land after the next base when that base is kerned in
+/// ahead of the pen.
+fn sort_along_x_keeping_marks(group: &mut [&TextItem]) {
+    let mut keys: Vec<f32> = Vec::with_capacity(group.len());
+    // The fragment the one before this sorts with: itself, or for a sign
+    // kept after its base, that base.
+    let mut previous_base: Option<usize> = None;
+    for (index, item) in group.iter().enumerate() {
+        let base = previous_base
+            .filter(|&base| is_zero_width_mark(item) && inside_advance(group[base], item.x));
+        keys.push(base.map_or(item.x, |base| keys[base]));
+        previous_base = Some(base.unwrap_or(index));
+    }
+    let mut order: Vec<usize> = (0..group.len()).collect();
+    order.sort_by(|&a, &b| keys[a].total_cmp(&keys[b]));
+    let sorted: Vec<&TextItem> = order.iter().map(|&index| group[index]).collect();
+    group.copy_from_slice(&sorted);
+}
+
 fn is_standalone_bullet_text(text: &str) -> bool {
     matches!(text.trim(), "•" | "○" | "●" | "◦")
 }
@@ -1223,9 +1278,6 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
     let mut end_x = first.x + effective_merge_width(first);
     let mut end = start;
     for (offset, next) in group[start + 1..].iter().enumerate() {
-        if next.text.trim().chars().count() != 1 {
-            break;
-        }
         if (next.font_size - fs).abs() > fs * 0.20 {
             break;
         }
@@ -1236,12 +1288,25 @@ fn tracked_run_space_floor(group: &[&TextItem], start: usize) -> Option<(usize, 
         {
             break;
         }
+        let next_end = next.x + effective_merge_width(next);
+        // A dependent sign over the letter before it — of a character or
+        // two — is no letter of the run, and the line's right edge does
+        // not move for it (as in the merge loop): the next letter's gap
+        // is measured from the pen the letter under the sign left.
+        if is_zero_width_mark(next) {
+            end_x = end_x.max(next_end);
+            end = start + 1 + offset;
+            continue;
+        }
+        if next.text.trim().chars().count() != 1 {
+            break;
+        }
         let gap = next.x - end_x;
         if gap > fs * 0.5 || gap < -fs * 0.5 {
             break;
         }
         gaps.push(gap / fs);
-        end_x = next.x + effective_merge_width(next);
+        end_x = next_end;
         end = start + 1 + offset;
     }
     if gaps.len() < 2 {
@@ -1814,7 +1879,8 @@ fn merge_text_items_with_clips(
         /// For a `bidi` line, each fragment's position in screen order.
         display_index: Vec<usize>,
         /// For a `bidi` line, the gap between each pair of screen
-        /// neighbours, in points, by screen position.
+        /// neighbours, in points, by screen position: from the line's right
+        /// edge so far, which a dependent sign does not move.
         display_gaps: Vec<f32>,
         /// For a `bidi` line shown one glyph per fragment, the word-gap
         /// floor its own gaps give (`glyph_run_word_gap_floor`), in em of
@@ -1848,22 +1914,36 @@ fn merge_text_items_with_clips(
                 |i| *i,
                 page_rtl.get(&page).copied().unwrap_or(false),
             );
-            group.sort_by(|a, b| a.x.total_cmp(&b.x));
+            // Screen order, with a dependent sign kept after the letter it
+            // was shown on, as on a left-to-right line.
+            sort_along_x_keeping_marks(&mut group);
             // The gaps between screen neighbours, taken once here: two
             // glyphs at one x (a mark over its letter) sort either way, and
-            // the reading order below must index the same sequence.
-            display_gaps = group
-                .windows(2)
-                .map(|pair| pair[1].x - (pair[0].x + effective_merge_width(pair[0])))
-                .collect();
+            // the reading order below must index the same sequence. A
+            // dependent sign sits behind the pen and does not move the
+            // line's right edge: the fragment after it is measured from
+            // where the letter under it left the pen.
+            display_gaps = Vec::with_capacity(group.len().saturating_sub(1));
+            let mut right_edge: Option<f32> = None;
+            for item in &group {
+                let end = item.x + effective_merge_width(item);
+                if let Some(edge) = right_edge {
+                    display_gaps.push(item.x - edge);
+                }
+                right_edge = Some(match right_edge {
+                    Some(edge) if is_zero_width_mark(item) => edge.max(end),
+                    _ => end,
+                });
+            }
             // Glyph-by-glyph positioned RTL text clusters into words by the
             // line's own gaps: adjacent glyphs abut, word gaps do not, with
             // the floor below where declared widths are off. Junctions
             // inside a number are never word gaps and say nothing about the
             // letters' gaps either (digits of another font keep true
-            // widths), so they stay out of the sample. The same floor
-            // separates the words for the bidi analysis and, below, for the
-            // merge.
+            // widths), so they stay out of the sample, and so do the
+            // junctions at a dependent sign, which is no letter of the
+            // line. The same floor separates the words for the bidi
+            // analysis and, below, for the merge.
             let single_glyphs = group
                 .iter()
                 .filter(|i| i.text.trim().chars().count() == 1)
@@ -1872,7 +1952,11 @@ fn merge_text_items_with_clips(
                 let gaps: Vec<f32> = group
                     .windows(2)
                     .zip(&display_gaps)
-                    .filter(|(pair, _)| !inside_number(&pair[0].text, &pair[1].text))
+                    .filter(|(pair, _)| {
+                        !inside_number(&pair[0].text, &pair[1].text)
+                            && !is_zero_width_mark(pair[0])
+                            && !is_zero_width_mark(pair[1])
+                    })
                     .map(|(pair, gap)| gap / pair[0].font_size.min(pair[1].font_size).max(1.0))
                     .collect();
                 glyph_floor = glyph_run_word_gap_floor(&gaps);
@@ -1901,7 +1985,7 @@ fn merge_text_items_with_clips(
             group = reordered;
         } else {
             if !preserve_stream_order {
-                group.sort_by(|a, b| a.x.total_cmp(&b.x));
+                sort_along_x_keeping_marks(&mut group);
             }
             texts = group
                 .iter()
@@ -2032,7 +2116,12 @@ fn merge_text_items_with_clips(
                 if gap > x_gap_max {
                     break;
                 }
-                if gap < -first.font_size * 0.5 && !preserve_stream_order {
+                // A dependent sign is drawn over the glyph before it, as far
+                // behind the pen as that glyph is wide: it stays with it.
+                if gap < -first.font_size * 0.5
+                    && !preserve_stream_order
+                    && !is_zero_width_mark(next)
+                {
                     break;
                 }
                 let previous = group[j - 1];
@@ -2136,7 +2225,11 @@ fn merge_text_items_with_clips(
                 box_right = box_right.max(next.x + next.width);
                 box_left = box_left.min(next.x);
                 let next_end = next.x + effective_merge_width(next);
-                end_x = if *preserve_stream_order {
+                // The line's right edge does not move for a dependent sign
+                // drawn behind the pen: the fragment after the sign is
+                // measured from where the glyph under it left the pen, not
+                // from the sign's origin.
+                end_x = if *preserve_stream_order || is_zero_width_mark(next) {
                     end_x.max(next_end)
                 } else {
                     next_end
@@ -5151,5 +5244,163 @@ BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
                 "{merged:?}"
             );
         }
+    }
+
+    /// The six glyphs of a word in a script whose subscript letters and
+    /// vowel signs have zero advance, shown one `Tm` and `Tj` per glyph at
+    /// 12 pt: each sign sits about 0.23 em behind the pen, over the glyph
+    /// before it, and the glyph after it starts where the pen was.
+    fn signed_word_glyphs() -> Vec<TextItem> {
+        vec![
+            make_merge_item("\u{1789}\u{17D2}", 20.0, 11.496),
+            make_merge_item("\u{1789}", 28.82, 0.0),
+            make_merge_item("\u{179C}", 31.496, 4.128),
+            make_merge_item("\u{178F}\u{17D2}", 35.624, 9.9),
+            make_merge_item("\u{1790}", 42.572, 0.0),
+            make_merge_item("\u{17BB}", 45.524, 3.312),
+        ]
+    }
+
+    #[test]
+    fn signs_behind_the_pen_open_no_gap_before_the_next_glyph() {
+        // The glyph after a sign is measured from where the glyph under the
+        // sign left the pen, not from the sign's origin 2.7 pt behind it;
+        // the merged box ends where the last glyph does.
+        let merged = merge_text_items(signed_word_glyphs());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].text,
+            "\u{1789}\u{17D2}\u{1789}\u{179C}\u{178F}\u{17D2}\u{1790}\u{17BB}"
+        );
+        assert!((merged[0].x + merged[0].width - 48.836).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_word_gap_after_a_sign_is_still_a_space() {
+        // The second half of the word moved 4 pt (a third of an em) on
+        // from where the pen was: a word gap after the sign.
+        let mut items = signed_word_glyphs();
+        for item in &mut items[3..] {
+            item.x += 4.0;
+        }
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].text,
+            "\u{1789}\u{17D2}\u{1789}\u{179C} \u{178F}\u{17D2}\u{1790}\u{17BB}"
+        );
+    }
+
+    #[test]
+    fn a_sign_within_its_glyphs_advance_keeps_its_place_past_a_kerned_glyph() {
+        // Shown as glyph, sign, glyph, with the second glyph kerned in
+        // 0.5 pt ahead of the pen and the sign 0.2 pt behind it: by x
+        // alone the sign would follow the second glyph.
+        let items = vec![
+            make_merge_item("\u{1780}", 20.0, 11.496),
+            make_merge_item("\u{17BB}", 31.3, 0.0),
+            make_merge_item("\u{1781}", 31.0, 4.128),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "\u{1780}\u{17BB}\u{1781}");
+
+        // A sign shown before the glyph it is over sorts by its own x, as
+        // any fragment does.
+        let items = vec![
+            make_merge_item("\u{1780}", 20.0, 11.496),
+            make_merge_item("\u{17BB}", 40.0, 0.0),
+            make_merge_item("\u{1781}", 31.496, 4.128),
+            make_merge_item("\u{1782}", 35.624, 9.9),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "\u{1780}\u{1781}\u{1782}\u{17BB}");
+    }
+
+    #[test]
+    fn a_two_character_sign_inside_a_tracked_run_keeps_the_run_tracked() {
+        // Display tracking with a sign that decodes to two combining marks
+        // over the `O`: the sign is no letter of the run, the run reads its
+        // tracking across it, and the sign stays in its place without a
+        // space on either side.
+        let mut items = glyph_run("HOW", 100.0, 10.0, 2.3);
+        items.insert(2, make_merge_item("\u{0301}\u{0300}", 118.0, 0.0));
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "HO\u{0301}\u{0300}W");
+    }
+
+    /// A pointed right-to-left word shown one glyph per item by a producer
+    /// walking the line right to left: the first letter, then the second
+    /// with its vowel sign 0.3 em behind the pen, then the third.
+    fn pointed_rtl_word() -> Vec<TextItem> {
+        vec![
+            make_merge_item("\u{05D1}", 130.0, 6.0),
+            make_merge_item("\u{05D0}", 124.0, 6.0),
+            make_merge_item("\u{05B8}", 126.4, 0.0),
+            make_merge_item("\u{05DC}", 118.0, 6.0),
+        ]
+    }
+
+    #[test]
+    fn a_sign_on_a_right_to_left_line_follows_its_letter_in_the_reading() {
+        // The sign follows the letter it was shown on once the line is
+        // read into logical order, with no space on either side, whether
+        // the page stores its runs in visual or in logical order.
+        for visual in [false, true] {
+            let merged = merge_text_items_with_clips(pointed_rtl_word(), &[], visual, &[]);
+            assert_eq!(merged.len(), 1, "visual={visual}: {merged:?}");
+            assert_eq!(
+                merged[0].text, "\u{05D1}\u{05D0}\u{05B8}\u{05DC}",
+                "visual={visual}"
+            );
+        }
+        // The next letter kerned in over the end of the pointed one, the
+        // sign a hair past it in x: the sign still sorts after its letter.
+        let mut items = pointed_rtl_word();
+        items[0].x = 129.7;
+        items[2].x = 129.8;
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "\u{05D1}\u{05D0}\u{05B8}\u{05DC}");
+        // A quarter em from the sign's letter to the next is a word gap,
+        // measured from the letter, not from the sign behind the pen.
+        let mut items = pointed_rtl_word();
+        items[3].x = 115.0;
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "\u{05D1}\u{05D0}\u{05B8} \u{05DC}");
+    }
+
+    #[test]
+    fn a_longer_run_without_advance_is_hidden_text_not_a_sign() {
+        // Many zero-advance glyphs shown at the pen after a display-size
+        // number, over which a line of body text starts: hidden text, not
+        // a sign. It sorts by its own x, after the body text, and stays an
+        // item of its own as before.
+        let mut number = make_merge_item("24", 20.0, 120.0);
+        number.font_size = 148.0;
+        let mut hidden = make_merge_item("++3737++33", 139.0, 0.0);
+        hidden.font_size = 148.0;
+        let body = make_merge_item("tank with", 100.0, 60.0);
+        let merged = merge_text_items(vec![number, hidden, body]);
+        let texts: Vec<&str> = merged.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, ["24", "tank with", "++3737++33"]);
+    }
+
+    #[test]
+    fn a_sign_deep_behind_the_pen_stays_with_its_glyph() {
+        // A sign over the middle of a wide glyph, 0.55 em behind the pen:
+        // the backward-gap break that ends an item does not apply to it,
+        // and the glyph after it is measured from the pen.
+        let items = vec![
+            make_merge_item("\u{1780}", 20.0, 14.4),
+            make_merge_item("\u{17BB}", 27.8, 0.0),
+            make_merge_item("\u{1781}", 34.4, 4.128),
+        ];
+        let merged = merge_text_items(items);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "\u{1780}\u{17BB}\u{1781}");
     }
 }
