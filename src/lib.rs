@@ -130,6 +130,13 @@ pub const OCR_REASON_NO_TEXT: &str = "no_text";
 /// rather than real text operators, so it cannot be extracted as characters.
 pub const OCR_REASON_VECTOR_TEXT: &str = "vector_text";
 
+/// OCR reason: every text-showing operator on the page leaves nothing to
+/// see — text render mode 3 (invisible), or mode 7 (clip only) with
+/// nothing painted through the clip — while an image covers at least half
+/// of the page: a scan carrying a text layer nobody sees. What that layer
+/// says is not what the page shows, so the page is read from its raster.
+pub const OCR_REASON_INVISIBLE_TEXT_LAYER: &str = "invisible_text_layer";
+
 // =========================================================================
 // Result type
 // =========================================================================
@@ -697,12 +704,18 @@ fn extract_pages_markdown_mem_impl(
         // embedded-font body text elsewhere would otherwise still extract
         // non-empty, non-garbled markdown and miss OCR routing entirely.
         // detect_from_document's Mixed-type per-page routing always sends
-        // these pages to OCR; mirror that here too. Both signals share one
+        // these pages to OCR; mirror that here too. And a page whose every
+        // text-showing operator is invisible under a covering image: the
+        // text layer it extracts describes the raster rather than being
+        // the page's content. All three signals share one
         // analyze_page_content pass — see page_ocr_signals's doc comment.
-        let (has_template_image, has_vector_text) = lopdf_pages
+        let signals = lopdf_pages
             .get(&page_1idx)
             .map(|&page_id| detector::page_ocr_signals(&doc, page_id))
-            .unwrap_or((false, false));
+            .unwrap_or_default();
+        let has_template_image = signals.template_image_needs_ocr;
+        let has_vector_text = signals.has_vector_text;
+        let has_invisible_text_layer = signals.has_invisible_text_layer;
 
         // Build markdown with document-wide font stats
         let options = MarkdownOptions {
@@ -734,6 +747,18 @@ fn extract_pages_markdown_mem_impl(
 
         let has_decoding_issue = has_text_quality_issue
             || (!md.is_empty() && (is_cid_garbage(&md) || detect_encoding_issues(&md)));
+        // First among a page's reasons, as classification's
+        // `page_ocr_reasons` lists it too, so a page whose whole text layer
+        // is hidden under a scan — a scan whatever its fonts are — gets the
+        // same first reason from both surfaces; the reasons after it keep
+        // this surface's own order.
+        if has_invisible_text_layer {
+            add_ocr_reason(
+                &mut ocr_reasons_by_page,
+                page_1idx,
+                OCR_REASON_INVISIBLE_TEXT_LAYER,
+            );
+        }
         if has_decoding_issue {
             add_ocr_reason(
                 &mut ocr_reasons_by_page,
@@ -754,7 +779,8 @@ fn extract_pages_markdown_mem_impl(
             || has_gid
             || is_garbage_text(&md)
             || has_template_image
-            || has_vector_text;
+            || has_vector_text
+            || has_invisible_text_layer;
 
         if needs_ocr {
             pages_needing_ocr.push(page_1idx);
@@ -4851,8 +4877,9 @@ fn process_document(
         processing_time_ms: start.elapsed_ms(),
         pages_needing_ocr,
         ocr_reasons_by_page: {
-            // Detector reasons (scanned / no_text / vector_text / garbled) merged
-            // with the markdown-stage garbled detection, deduped per page.
+            // Detector reasons (scanned / no_text / vector_text /
+            // invisible_text_layer / garbled) merged with the
+            // markdown-stage garbled detection, deduped per page.
             let mut merged = detection_ocr_reasons;
             merge_ocr_reasons(&mut merged, text_quality_reasons_by_page);
             page_ocr_reasons_vec(merged)

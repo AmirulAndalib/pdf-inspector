@@ -106,6 +106,52 @@ Changes since 1.22.1.
   without zero-advance glyphs, and producers that position right-to-left
   text with real backtracks past painted letters, read as before.
   ([#564](https://github.com/firecrawl/pdf-inspector/pull/564))
+- A scanned page whose producer added a text layer nobody sees — an image
+  drawn over at least half of the page, then hundreds of text-showing
+  operators under text render mode 3 (invisible) or 7 (clip only) — was
+  classified as a text page, because the operator count never consulted
+  the render mode; its raster went unread and the layer, which need not
+  say what the page shows, was served as the page. Classification now
+  follows `Tr` and `cm` through `q`/`Q`, and through the Form XObjects
+  the content invokes with `Do` (at each invocation, clipped to the
+  form's `/BBox`), and flags a page whose every executed text-showing
+  operator leaves nothing to see, while the images it draws — tallied on
+  a grid over the page, so a scan tiled into strips counts — cover at
+  least half of it (each draw clipped to the page and to the rectangular
+  clipping path in force, a clip of any other shape by its box; an inline
+  image the content draws counts as an image — for whether the page has
+  any at all as well — and so does a path filled or stroked with a tiling
+  pattern whose cell draws one; images bound but never drawn, and
+  forms never invoked, do not count; a page whose forms outrun the scan's
+  budget of invocations or of bytes executed, or whose graphics state
+  nests deeper than the scan follows, is not flagged), for OCR
+  with the new reason `invisible_text_layer`
+  (`OCR_REASON_INVISIBLE_TEXT_LAYER`): the reason appears in
+  `pages_needing_ocr`/`ocr_reasons_by_page` and in the per-page
+  `needs_ocr`/`ocr_reason`, for the pages a sample left out as well, and
+  first among a page's reasons on both surfaces; the classification
+  (`pdf_type`) changes in response. Mode-7 text that an
+  image, a shading, a painted path or visible text is later drawn through
+  — a title filled with a picture — is visible and not counted, its
+  glyphs placed by the text-positioning operators and the font size
+  (text placed by neither is shown by any paint within the clip); paint
+  that misses the glyphs shows nothing through them, nor does a form that
+  paints nothing, or a draw off the page or clipped away. Operators are
+  read past
+  strings, comments and inline image data, and whether or not whitespace
+  follows them, so text saying `3 Tr` sets no render mode and `(a)Tj(b)Tj`
+  shows twice; text shown with the `'` and `"` operators counts as text,
+  here and in the text-operator tallies, which had always missed it,
+  while a show operator with nothing to show does not count in either;
+  a name written with `#xx` escapes (`/Im#30 Do`) finds the resource it
+  names, NUL separates operands as the other whitespace bytes do, and
+  unfiltered inline image data is skipped by the length its header gives,
+  so that an `EI` among its bytes ends nothing.
+  A page whose layer is painted, a page with a visible
+  caption over its image, invisible text with no image under it and an
+  image with no text keep their classification and reasons; what is
+  extracted is unchanged.
+  ([#566](https://github.com/firecrawl/pdf-inspector/pull/566))
 
 ## [1.22.1] - 2026-09-20
 

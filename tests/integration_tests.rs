@@ -17,6 +17,10 @@ use pdf_inspector::{
     PdfType, TextItem,
 };
 use pdf_inspector::{
+    detect_pdf_type_mem, detect_pdf_type_mem_with_config, PageOcrReasons,
+    OCR_REASON_INVISIBLE_TEXT_LAYER, OCR_REASON_SCANNED, OCR_REASON_VECTOR_TEXT,
+};
+use pdf_inspector::{
     extract_tables_in_regions_mem_in_frame, extract_text_in_regions_mem_in_frame,
     extract_text_with_positions_and_rotations_mem_in_frame,
     extract_text_with_positions_mem_in_frame, PositionFrame,
@@ -2531,6 +2535,913 @@ fn make_pdf_with_custom_text_layer(
 
 fn make_pdf_with_text_layer(text_render_mode: i32, visible_extra: Option<&str>) -> Vec<u8> {
     make_pdf_with_custom_text_layer(text_render_mode, visible_extra, None, false)
+}
+
+/// One page of [`make_pdf_with_glyph_layer`].
+#[derive(Clone, Copy)]
+struct GlyphLayerPage {
+    /// Draw the 2×2 gray image `Im0` — the 1500×2383 `ImBig` when
+    /// `large_image` — scaled with `cm` over the whole page, shifted right
+    /// by `image_dx` points.
+    covering_image: bool,
+    large_image: bool,
+    image_dx: i32,
+    /// Bind `ImBig` in the page's resources without drawing it.
+    spare_large_image: bool,
+    /// Text render mode, set once, of a layer of `layer_glyphs` one-glyph
+    /// showing blocks (`Tj`, or `'` and `"` with `quote_operators`); `None`
+    /// for no layer.
+    layer_mode: Option<u8>,
+    layer_glyphs: usize,
+    /// Put the layer in a Form XObject `Fm0` instead of the page's content,
+    /// invoked from the page when `invoke_form`, else bound and never run.
+    layer_in_form: bool,
+    invoke_form: bool,
+    /// Draw the image again after the layer, through any clip it set.
+    image_after_layer: bool,
+    /// Draw the 2×2 image after the layer as well, 20 points square with
+    /// its corner at the point given — through any clip the layer set,
+    /// where it lands.
+    small_image_after_layer: Option<(i32, i32)>,
+    /// Filled subpaths of five path operators each, painted before the
+    /// layer, as outlined glyphs would be.
+    vector_paths: usize,
+    /// Draw the covering image as this many horizontal strips instead of
+    /// one draw; 0 for one draw.
+    image_strips: usize,
+    /// Draw the covering image as an inline image (`BI … ID … EI`)
+    /// instead of an image XObject.
+    inline_image: bool,
+    /// Fill the whole page with a tiling pattern `P1` — one whose cell
+    /// draws the image when `pattern_draws_image`, else one drawing only
+    /// paths — before the layer.
+    pattern_fill: bool,
+    pattern_draws_image: bool,
+    /// Fill the whole page with a plain colour before the layer.
+    plain_fill: bool,
+    /// Show the layer with the `'` and `"` operators instead of `Tj`.
+    quote_operators: bool,
+    /// Wrap the body text in marked content whose property list has an
+    /// `/ID` key.
+    marked_content_id: bool,
+    /// A line of visible text at the foot of the page.
+    caption: Option<&'static str>,
+    /// Lines of ordinary visible body text.
+    body_lines: usize,
+}
+
+/// A PDF of the given pages, in the shape a producer gives a scanned page
+/// with a text layer: the raster first, then the render mode, then one
+/// `BT … Tj ET` block per glyph.
+fn make_pdf_with_glyph_layer(pages: &[GlyphLayerPage]) -> Vec<u8> {
+    // Object bodies, numbered from 1: the catalog, then the page tree,
+    // written once the pages are numbered.
+    let mut objects: Vec<Vec<u8>> = vec![b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), Vec::new()];
+    fn add(objects: &mut Vec<Vec<u8>>, body: Vec<u8>) -> usize {
+        objects.push(body);
+        objects.len()
+    }
+    fn stream(dict: &str, data: &[u8]) -> Vec<u8> {
+        let mut body = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\nendstream");
+        body
+    }
+    let font = add(
+        &mut objects,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    );
+    let image = add(
+        &mut objects,
+        stream(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &[200, 60, 60, 200],
+        ),
+    );
+    // A flat gray raster of scan size, deflated as a producer stores it,
+    // made when a page binds it.
+    let binds_large = |page: &GlyphLayerPage| {
+        page.spare_large_image
+            || ((page.covering_image || page.image_after_layer) && page.large_image)
+    };
+    let large = pages.iter().any(binds_large).then(|| {
+        let mut raster = lopdf::Stream::new(lopdf::dictionary! {}, vec![128u8; 1500 * 2383]);
+        raster.compress().expect("a flat raster deflates");
+        add(
+            &mut objects,
+            stream(
+                "/Type /XObject /Subtype /Image /Width 1500 /Height 2383 \
+                 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+                &raster.content,
+            ),
+        )
+    });
+    let mut kids = Vec::new();
+    for page in pages {
+        let mut xobjects = String::new();
+        let mut content = String::new();
+        let draws =
+            page.covering_image || page.image_after_layer || page.small_image_after_layer.is_some();
+        if (draws && !page.large_image && !page.inline_image)
+            || page.small_image_after_layer.is_some()
+        {
+            xobjects.push_str(&format!(" /Im0 {image} 0 R"));
+        }
+        if binds_large(page) {
+            let large = large.expect("made when a page binds it");
+            xobjects.push_str(&format!(" /ImBig {large} 0 R"));
+        }
+        let raster = if page.inline_image {
+            "BI /W 2 /H 2 /BPC 8 /CS /G ID abcd EI".to_string()
+        } else {
+            format!("/{} Do", if page.large_image { "ImBig" } else { "Im0" })
+        };
+        let draw_image = format!("q 612 0 0 792 {} 0 cm {raster} Q\n", page.image_dx);
+        let mut pattern_entry = String::new();
+        if page.pattern_fill {
+            let cell = if page.pattern_draws_image {
+                "q 612 0 0 792 0 0 cm /Im0 Do Q"
+            } else {
+                "0 0 10 10 re f"
+            };
+            let pattern = add(
+                &mut objects,
+                stream(
+                    &format!(
+                        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 \
+                         /BBox [0 0 612 792] /XStep 612 /YStep 792 \
+                         /Resources << /XObject << /Im0 {image} 0 R >> >>"
+                    ),
+                    cell.as_bytes(),
+                ),
+            );
+            pattern_entry = format!(" /Pattern << /P1 {pattern} 0 R >>");
+            content.push_str("/Pattern cs /P1 scn 0 0 612 792 re f\n");
+        }
+        if page.plain_fill {
+            content.push_str("0.5 g 0 0 612 792 re f\n");
+        }
+        if page.covering_image && page.image_strips > 0 {
+            let strip = 792.0 / page.image_strips as f64;
+            for k in 0..page.image_strips {
+                content.push_str(&format!(
+                    "q 612 0 0 {strip} {} {} cm {raster} Q\n",
+                    page.image_dx,
+                    k as f64 * strip
+                ));
+            }
+        } else if page.covering_image {
+            content.push_str(&draw_image);
+        }
+        for _ in 0..page.vector_paths {
+            content.push_str("100 200 m 150 250 l 200 200 100 100 200 200 c h f\n");
+        }
+        if page.body_lines > 0 {
+            if page.marked_content_id {
+                content.push_str("/Span <</ID 7 /MCID 0>> BDC\n");
+            }
+            content.push_str("BT /F1 12 Tf 72 720 Td ");
+            for line in 0..page.body_lines {
+                if line > 0 {
+                    content.push_str("0 -16 Td ");
+                }
+                content.push_str(&format!(
+                    "(Paragraph line {line} with ordinary body text) Tj "
+                ));
+            }
+            content.push_str("ET\n");
+            if page.marked_content_id {
+                content.push_str("EMC\n");
+            }
+        }
+        if let Some(mode) = page.layer_mode {
+            let mut layer = format!("{mode} Tr\n");
+            let glyphs = "thepagecarriesalayernobodysees"
+                .chars()
+                .cycle()
+                .take(page.layer_glyphs);
+            if page.quote_operators {
+                // One glyph per line, `'` and `"` in turn, under a leading
+                // small enough to keep every line on the page.
+                layer.push_str("BT /F1 10 Tf 5 TL 72 720 Td\n");
+                for (n, glyph) in glyphs.enumerate() {
+                    if n % 2 == 0 {
+                        layer.push_str(&format!("({glyph}) '\n"));
+                    } else {
+                        layer.push_str(&format!("0 0 ({glyph}) \"\n"));
+                    }
+                }
+                layer.push_str("ET\n");
+            } else {
+                for (n, glyph) in glyphs.enumerate() {
+                    let x = 72 + (n % 40) * 12;
+                    let y = 720 - (n / 40) * 14;
+                    layer.push_str(&format!(
+                        "BT 1 0 0 1 {x} {y} Tm /F1 10 Tf ({glyph}) Tj ET\n"
+                    ));
+                }
+            }
+            if page.layer_in_form {
+                let form = add(
+                    &mut objects,
+                    stream(
+                        &format!(
+                            "/Type /XObject /Subtype /Form /BBox [0 0 612 792] \
+                             /Resources << /Font << /F1 {font} 0 R >> >>"
+                        ),
+                        layer.as_bytes(),
+                    ),
+                );
+                xobjects.push_str(&format!(" /Fm0 {form} 0 R"));
+                if page.invoke_form {
+                    content.push_str("/Fm0 Do\n");
+                }
+            } else {
+                content.push_str(&layer);
+            }
+        }
+        if page.image_after_layer {
+            content.push_str(&draw_image);
+        }
+        if let Some((x, y)) = page.small_image_after_layer {
+            content.push_str(&format!("q 20 0 0 20 {x} {y} cm /Im0 Do Q\n"));
+        }
+        if let Some(caption) = page.caption {
+            content.push_str(&format!("BT 0 Tr /F1 12 Tf 72 40 Td ({caption}) Tj ET\n"));
+        }
+        let contents = add(&mut objects, stream("", content.as_bytes()));
+        let xobject_entry = if xobjects.is_empty() {
+            String::new()
+        } else {
+            format!(" /XObject <<{xobjects} >>")
+        };
+        let page_object = add(
+            &mut objects,
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 {font} 0 R >>{xobject_entry}{pattern_entry} >> \
+                 /Contents {contents} 0 R >>"
+            )
+            .into_bytes(),
+        );
+        kids.push(format!("{page_object} 0 R"));
+    }
+    objects[1] = format!(
+        "<< /Type /Pages /Kids [{}] /Count {} >>",
+        kids.join(" "),
+        pages.len()
+    )
+    .into_bytes();
+
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (index, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            objects.len() + 1,
+            xref_start
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+const SCAN_WITH_INVISIBLE_LAYER: GlyphLayerPage = GlyphLayerPage {
+    covering_image: true,
+    large_image: false,
+    image_dx: 0,
+    spare_large_image: false,
+    layer_mode: Some(3),
+    layer_glyphs: 120,
+    layer_in_form: false,
+    invoke_form: false,
+    image_after_layer: false,
+    small_image_after_layer: None,
+    vector_paths: 0,
+    image_strips: 0,
+    inline_image: false,
+    pattern_fill: false,
+    pattern_draws_image: false,
+    plain_fill: false,
+    quote_operators: false,
+    marked_content_id: false,
+    caption: None,
+    body_lines: 0,
+};
+
+fn invisible_text_layer_reasons(page: u32) -> Vec<PageOcrReasons> {
+    vec![PageOcrReasons {
+        page,
+        reasons: vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()],
+    }]
+}
+
+/// A page whose only text is a layer nobody sees (render mode 3, or 7)
+/// under an image drawn over the whole page is not a text page, however
+/// many glyphs the layer has: classification flags it for OCR with
+/// `invisible_text_layer`, and per-page extraction agrees.
+#[test]
+fn test_invisible_text_layer_under_covering_image_needs_ocr() {
+    for mode in [3u8, 7] {
+        let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+            layer_mode: Some(mode),
+            ..SCAN_WITH_INVISIBLE_LAYER
+        }]);
+
+        let detected = detect_pdf_type_mem(&buf).unwrap();
+        assert_ne!(detected.pdf_type, PdfType::TextBased, "mode {mode}");
+        assert_eq!(detected.pages_needing_ocr, vec![1], "mode {mode}");
+        assert_eq!(
+            detected.ocr_reasons_by_page.get(&1),
+            Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()]),
+            "mode {mode}"
+        );
+
+        let processed = process_pdf_mem(&buf).unwrap();
+        assert_ne!(processed.pdf_type, PdfType::TextBased, "mode {mode}");
+        assert_eq!(processed.pages_needing_ocr, vec![1], "mode {mode}");
+        assert_eq!(
+            processed.ocr_reasons_by_page,
+            invisible_text_layer_reasons(1),
+            "mode {mode}"
+        );
+
+        let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+        assert!(pages.pages[0].needs_ocr, "mode {mode}");
+        assert_eq!(
+            pages.pages[0].ocr_reason.as_deref(),
+            Some(OCR_REASON_INVISIBLE_TEXT_LAYER),
+            "mode {mode}"
+        );
+        assert!(pages.pages[0].markdown.is_empty(), "mode {mode}");
+        assert_eq!(pages.pages_needing_ocr, vec![1], "mode {mode}");
+        assert_eq!(
+            pages.ocr_reasons_by_page,
+            invisible_text_layer_reasons(1),
+            "mode {mode}"
+        );
+    }
+}
+
+/// The same layer painted (render mode 0) is a text page over an image,
+/// and keeps extracting as one.
+#[test]
+fn test_painted_text_layer_over_covering_image_stays_text() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_mode: Some(0),
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let processed = process_pdf_mem(&buf).unwrap();
+    assert_eq!(processed.pdf_type, PdfType::TextBased);
+    assert!(processed.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert_eq!(pages.pages[0].ocr_reason, None);
+    assert!(!pages.pages[0].markdown.is_empty());
+}
+
+/// Clip-only text (mode 7) that an image is painted through is visible —
+/// a title filled with a picture — so the page stays a text page; the
+/// same order of operators under mode 3, which sets no clip, is still a
+/// layer nobody sees.
+#[test]
+fn test_clip_text_filled_with_an_image_stays_text() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_mode: Some(7),
+        image_after_layer: true,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert!(!pages.pages[0].markdown.is_empty());
+
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        image_after_layer: true,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+}
+
+/// Clip-only text shows only where paint lands on its glyphs: a small
+/// image drawn after a mode-7 layer, in a corner the layer does not
+/// reach, leaves it a layer nobody sees; the same image drawn over the
+/// layer's first line shows the glyphs under it, and the page is a text
+/// page.
+#[test]
+fn test_clip_text_shows_only_where_paint_lands_on_it() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_mode: Some(7),
+        small_image_after_layer: Some((580, 20)),
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_mode: Some(7),
+        small_image_after_layer: Some((60, 710)),
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert_eq!(pages.pages[0].ocr_reason, None);
+}
+
+/// An image drawn mostly off the page covers only the part of it that
+/// lies on the page: a layer over one is not a layer nobody sees, while
+/// an image shifted a little still covers the page.
+#[test]
+fn test_image_drawn_off_the_page_does_not_cover_it() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        image_dx: 500,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        image_dx: -100,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+}
+
+/// Resources a page binds without using them are not its content: a large
+/// image never drawn and a form holding a hidden layer never invoked leave
+/// a page of visible text a text page, while the same image drawn and the
+/// same form invoked, and nothing else, are a layer nobody sees.
+#[test]
+fn test_resources_bound_but_unused_are_not_evidence() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        covering_image: false,
+        spare_large_image: true,
+        layer_in_form: true,
+        invoke_form: false,
+        body_lines: 12,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert!(pages.pages[0].markdown.contains("Paragraph line 3"));
+
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        covering_image: true,
+        large_image: true,
+        layer_in_form: true,
+        invoke_form: true,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(pages.pages[0].needs_ocr);
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+}
+
+/// A page filled with a tiling pattern whose cell draws the scan image is
+/// covered by that image: a hidden layer over it is a layer nobody sees;
+/// a pattern drawing only paths, or a fill without a pattern, leaves a
+/// text page.
+#[test]
+fn test_pattern_filled_scan_is_covered() {
+    let filled = GlyphLayerPage {
+        covering_image: false,
+        pattern_fill: true,
+        pattern_draws_image: true,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    };
+    let buf = make_pdf_with_glyph_layer(&[filled]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+
+    for page in [
+        GlyphLayerPage {
+            pattern_draws_image: false,
+            ..filled
+        },
+        GlyphLayerPage {
+            covering_image: false,
+            plain_fill: true,
+            ..SCAN_WITH_INVISIBLE_LAYER
+        },
+    ] {
+        let buf = make_pdf_with_glyph_layer(&[page]);
+        let detected = detect_pdf_type_mem(&buf).unwrap();
+        assert_eq!(detected.pdf_type, PdfType::TextBased);
+        assert!(detected.pages_needing_ocr.is_empty());
+        let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+        assert_ne!(
+            pages.pages[0].ocr_reason.as_deref(),
+            Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+        );
+    }
+}
+
+/// A raster drawn as an inline image covers the page as an image XObject
+/// does: the hidden layer over it is a layer nobody sees, while the same
+/// inline image shifted mostly off the page leaves a text page.
+#[test]
+fn test_inline_image_raster_covers_the_page() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        inline_image: true,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        inline_image: true,
+        image_dx: 500,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_ne!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+
+    // The inline image alone, with no text at all, is a scan — the page
+    // has an image though its resources bind none.
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        inline_image: true,
+        layer_mode: None,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::Scanned);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_SCANNED.to_string()])
+    );
+    let processed = process_pdf_mem(&buf).unwrap();
+    assert_eq!(processed.pdf_type, PdfType::Scanned);
+}
+
+/// A scan tiled into two thousand strips — image XObjects or inline
+/// images — covers the page as one draw does: the hidden layer over it
+/// is a layer nobody sees.
+#[test]
+fn test_scan_tiled_into_strips_is_covered() {
+    for inline_image in [false, true] {
+        let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+            image_strips: 2000,
+            inline_image,
+            ..SCAN_WITH_INVISIBLE_LAYER
+        }]);
+        let detected = detect_pdf_type_mem(&buf).unwrap();
+        assert_ne!(
+            detected.pdf_type,
+            PdfType::TextBased,
+            "inline {inline_image}"
+        );
+        assert_eq!(detected.pages_needing_ocr, vec![1], "inline {inline_image}");
+        assert_eq!(
+            detected.ocr_reasons_by_page.get(&1),
+            Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()]),
+            "inline {inline_image}"
+        );
+        let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+        assert_eq!(
+            pages.pages[0].ocr_reason.as_deref(),
+            Some(OCR_REASON_INVISIBLE_TEXT_LAYER),
+            "inline {inline_image}"
+        );
+    }
+}
+
+/// A layer shown only with the `'` and `"` operators is a text layer like
+/// any other: hidden under a covering image it is a layer nobody sees;
+/// painted, it is a text page.
+#[test]
+fn test_quote_operator_layer_follows_the_render_mode() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        quote_operators: true,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_ne!(detected.pdf_type, PdfType::TextBased);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(pages.pages[0].needs_ocr);
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        quote_operators: true,
+        layer_mode: Some(0),
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert!(!pages.pages[0].markdown.is_empty());
+}
+
+/// `/ID` is an ordinary name — here a marked-content property — and not
+/// the start of inline image data: the visible text after it is counted.
+#[test]
+fn test_id_name_is_not_inline_image_data() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        covering_image: false,
+        layer_mode: None,
+        marked_content_id: true,
+        body_lines: 12,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert!(pages.pages[0].markdown.contains("Paragraph line 3"));
+}
+
+/// A document longer than classification's sample, whose one page with a
+/// hidden layer lies outside the sample: that page still reports
+/// `invisible_text_layer`, the other pages `scanned`.
+#[test]
+fn test_hidden_layer_page_outside_the_sample_reports_its_reason() {
+    // Twelve pages, sampled eight at a time — 1–7 and 12 — so that page 9
+    // is not read for classification, whatever the default strategy.
+    let image_only = GlyphLayerPage {
+        layer_mode: None,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    };
+    let mut pages = [image_only; 12];
+    pages[8] = SCAN_WITH_INVISIBLE_LAYER;
+    let buf = make_pdf_with_glyph_layer(&pages);
+    let sample_of_eight = || DetectionConfig {
+        strategy: ScanStrategy::Sample(8),
+        ..DetectionConfig::default()
+    };
+
+    let detected = detect_pdf_type_mem_with_config(&buf, sample_of_eight()).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::Scanned);
+    assert_eq!(detected.pages_sampled, 8);
+    assert_eq!(detected.pages_needing_ocr, (1..=12).collect::<Vec<u32>>());
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&9),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    for page in [1u32, 8, 10, 12] {
+        assert_eq!(
+            detected.ocr_reasons_by_page.get(&page),
+            Some(&vec![OCR_REASON_SCANNED.to_string()]),
+            "page {page}"
+        );
+    }
+
+    let processed =
+        process_pdf_mem_with_options(&buf, PdfOptions::new().detection(sample_of_eight())).unwrap();
+    assert_eq!(processed.pdf_type, PdfType::Scanned);
+    assert_eq!(
+        processed
+            .ocr_reasons_by_page
+            .iter()
+            .find(|entry| entry.page == 9)
+            .map(|entry| entry.reasons.clone()),
+        Some(vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert_eq!(
+        pages.pages[8].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+}
+
+/// A page that is both vector text and a layer nobody sees under a scan
+/// is a scan first: classification and per-page extraction both name
+/// `invisible_text_layer` before `vector_text`.
+#[test]
+fn test_invisible_text_layer_is_the_first_reason_on_both_surfaces() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_glyphs: 4,
+        vector_paths: 300,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    let reasons = detected
+        .ocr_reasons_by_page
+        .get(&1)
+        .expect("the page needs OCR");
+    assert_eq!(
+        reasons,
+        &vec![
+            OCR_REASON_INVISIBLE_TEXT_LAYER.to_string(),
+            OCR_REASON_VECTOR_TEXT.to_string()
+        ]
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(pages.pages[0].needs_ocr);
+    assert_eq!(
+        pages.pages[0].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+    assert_eq!(
+        pages.ocr_reasons_by_page[0].reasons.first(),
+        reasons.first()
+    );
+    assert!(pages.ocr_reasons_by_page[0]
+        .reasons
+        .iter()
+        .any(|reason| reason == OCR_REASON_VECTOR_TEXT));
+}
+
+/// Invisible text with no image under it is not a scan: the page stays a
+/// text page and its layer is served, as before.
+#[test]
+fn test_invisible_text_without_an_image_stays_text() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        covering_image: false,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let processed = process_pdf_mem(&buf).unwrap();
+    assert_eq!(processed.pdf_type, PdfType::TextBased);
+    assert!(processed.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert!(!pages.pages[0].markdown.is_empty());
+}
+
+/// A visible caption over the covering image means the page shows text of
+/// its own; it keeps its text-page classification and its caption.
+#[test]
+fn test_visible_caption_over_covering_image_stays_text() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        caption: Some("Figure 1. A photograph"),
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::TextBased);
+    assert!(detected.pages_needing_ocr.is_empty());
+    let processed = process_pdf_mem(&buf).unwrap();
+    assert_eq!(processed.pdf_type, PdfType::TextBased);
+    assert!(processed.pages_needing_ocr.is_empty());
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert!(pages.pages[0].markdown.contains("Figure 1"));
+}
+
+/// An image alone is a scan with the `scanned` reason, as before.
+#[test]
+fn test_covering_image_alone_stays_scanned() {
+    let buf = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_mode: None,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let scanned_reasons = vec![PageOcrReasons {
+        page: 1,
+        reasons: vec![OCR_REASON_SCANNED.to_string()],
+    }];
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::Scanned);
+    assert_eq!(detected.pages_needing_ocr, vec![1]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&1),
+        Some(&vec![OCR_REASON_SCANNED.to_string()])
+    );
+    let processed = process_pdf_mem(&buf).unwrap();
+    assert_eq!(processed.pdf_type, PdfType::Scanned);
+    assert_eq!(processed.ocr_reasons_by_page, scanned_reasons);
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(pages.pages[0].needs_ocr);
+    assert_eq!(pages.pages_needing_ocr, vec![1]);
+}
+
+/// A text page followed by such a scan: the document is mixed, and only
+/// the scan is flagged, with its specific reason.
+#[test]
+fn test_invisible_text_layer_page_after_a_text_page_is_flagged_alone() {
+    let buf = make_pdf_with_glyph_layer(&[
+        GlyphLayerPage {
+            covering_image: false,
+            layer_mode: None,
+            body_lines: 12,
+            ..SCAN_WITH_INVISIBLE_LAYER
+        },
+        SCAN_WITH_INVISIBLE_LAYER,
+    ]);
+    let detected = detect_pdf_type_mem(&buf).unwrap();
+    assert_eq!(detected.pdf_type, PdfType::Mixed);
+    assert_eq!(detected.pages_needing_ocr, vec![2]);
+    assert_eq!(
+        detected.ocr_reasons_by_page.get(&2),
+        Some(&vec![OCR_REASON_INVISIBLE_TEXT_LAYER.to_string()])
+    );
+    let processed = process_pdf_mem(&buf).unwrap();
+    assert_eq!(processed.pdf_type, PdfType::Mixed);
+    assert_eq!(processed.pages_needing_ocr, vec![2]);
+    assert_eq!(
+        processed.ocr_reasons_by_page,
+        invisible_text_layer_reasons(2)
+    );
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap();
+    assert!(!pages.pages[0].needs_ocr);
+    assert!(pages.pages[0].markdown.contains("Paragraph line 3"));
+    assert!(pages.pages[1].needs_ocr);
+    assert_eq!(
+        pages.pages[1].ocr_reason.as_deref(),
+        Some(OCR_REASON_INVISIBLE_TEXT_LAYER)
+    );
+    assert_eq!(pages.pages_needing_ocr, vec![2]);
 }
 
 /// A scanned page whose only text is an invisible (Tr 3) OCR layer behind
