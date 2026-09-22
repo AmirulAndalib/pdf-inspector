@@ -59,7 +59,9 @@ pub struct CidDecodeStats {
     /// shows it as nothing. A byte of a single-byte CMap at or above 0x20 —
     /// DEL and the C1 range included — is stood in for by its Latin-1
     /// character, a byte below 0x20 reads as nothing; so not every unmapped
-    /// code shows as a replacement character.
+    /// code shows as a replacement character. A code whose entry is a
+    /// control destination ([`CodeMapping::ControlDestination`]) counts
+    /// here too, and shows as U+FFFD whatever the CMap's width.
     pub unmapped: u32,
 }
 
@@ -136,6 +138,612 @@ fn gap_fill_class(c: char) -> Option<GapFillClass> {
     }
 }
 
+/// What a CMap says about one code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CodeMapping {
+    /// The code's text.
+    Text(String),
+    /// The CMap has an entry for the code, but its destination is a control
+    /// character that stands for no text — U+0001–U+001F other than TAB, LF
+    /// and CR, or DEL — as when a producer writes a glyph's own index in
+    /// place of its character (a ligature glyph at index 18 gets
+    /// `<0012> <0012>`). The code is unmapped, and reads as U+FFFD rather
+    /// than as a control character a later pass would strip without a
+    /// trace.
+    ControlDestination,
+    /// The CMap has no entry for the code.
+    Unmapped,
+}
+
+/// A C0 control character other than TAB, LF and CR, or DEL: a destination
+/// character that stands for no text. NUL is left out here, as a
+/// destination padded with it (`<00000041>`) still spells its character; a
+/// destination of nothing but NUL is a control destination all the same
+/// (see [`destination_is_control`]).
+fn is_control_destination_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{01}'..='\u{08}' | '\u{0B}' | '\u{0C}' | '\u{0E}'..='\u{1F}' | '\u{7F}'
+    )
+}
+
+/// Whether a destination stands for no text: nothing but control
+/// characters, NUL padding aside — or nothing but NUL (`<0000>`, the index
+/// of glyph 0 written as its own destination, as a producer writing each
+/// glyph's index writes it), which a later pass would strip without a
+/// trace. An empty destination is not a control destination.
+fn destination_is_control(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let mut chars = text.chars().filter(|&ch| ch != '\0').peekable();
+    match chars.peek() {
+        None => true,
+        Some(_) => chars.all(is_control_destination_char),
+    }
+}
+
+/// Whether the destinations `base..=base + len` of a range lie in the C0
+/// control block, or are the one DEL: such a range holds nothing but
+/// controls and the whitespace among them, where one that runs on into
+/// printable characters sweeps through them.
+fn destination_span_is_control_block(base: u32, len: u32) -> bool {
+    base.saturating_add(len) <= 0x1F || (base == 0x7F && len == 0)
+}
+
+/// Repair the control destinations of `target`, a CMap read from a
+/// ToUnicode stream, from the font itself, each source for the codes the
+/// earlier ones left: the text `fallback` — the font's own reading the
+/// entry keeps: the CID collection's when the font has one, else the
+/// embedded program's — has for them; the program's reading,
+/// `program_reading`, when it is not that fallback, built only if a code
+/// is still left, as it decompresses and reads the program; then, in
+/// `program` — read only if a code is still left — a space for each code
+/// of a Type0 font whose glyph has no outline but an advance. A code a
+/// simple font's `/Differences` name is left to the name, which selects
+/// its glyph whatever the program's cmap holds at the raw code, and is
+/// read at decode time, font by font: several fonts can share one
+/// ToUnicode stream, and `target` is kept once for all of them. What
+/// nothing reads stays a control destination.
+fn repair_control_destinations<'p>(
+    target: &mut ToUnicodeCMap,
+    fallback: Option<&ToUnicodeCMap>,
+    program_reading: impl FnOnce() -> Option<&'p ToUnicodeCMap>,
+    program: impl FnOnce() -> Option<&'p [u8]>,
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+) {
+    let before = target.control_destination_codes();
+    if before.is_empty() {
+        return;
+    }
+    let named = differences_named_codes(font_dict, doc, &before);
+    let left = |target: &ToUnicodeCMap| -> Vec<u16> {
+        target
+            .control_destination_codes()
+            .into_iter()
+            .filter(|code| !named.contains(code))
+            .collect()
+    };
+    let mut codes = left(target);
+    if let Some(fallback) = fallback.filter(|_| !codes.is_empty()) {
+        target.recover_codes(&codes, fallback);
+        codes = left(target);
+    }
+    if !codes.is_empty() {
+        if let Some(reading) = program_reading() {
+            target.recover_codes(&codes, reading);
+            codes = left(target);
+        }
+    }
+    if !codes.is_empty() {
+        if let Some(program) = program() {
+            for (code, text) in blank_cid_glyph_spaces(font_dict, doc, program, &codes) {
+                target.char_map.insert(code, text);
+            }
+        }
+    }
+    // The entries changed: the gaps between them are read afresh, once.
+    if target.control_destination_codes() != before {
+        target.refresh_gap_fills();
+    }
+}
+
+/// Give a font's CMaps their roles in a [`CMapEntry`]. `primary` is the
+/// parsed ToUnicode CMap, `remapped` its subset remap when
+/// [`try_remap_subset_cmap`] made one, `fallback` the font's own reading
+/// when the caller built one, and `primary_entries` the number of entries
+/// the ToUnicode CMap was written with. A sparse ToUnicode CMap — fewer
+/// than ten entries — yields the primary role to the fallback and becomes
+/// the alternative reading, its remap dropped. With `promote`, a fallback
+/// with more entries than the ToUnicode CMap a remap was made of becomes
+/// the alternative and the remap the last resort: subset fonts number
+/// their glyphs by encounter order, so the sorted remap scrambles
+/// characters where the program's own cmap is authoritative.
+///
+/// The repair of the control destinations ([`repair_control_destinations`])
+/// runs before this, on the ToUnicode CMap and on its remap; what it fixed
+/// moves with each into whichever role it takes here.
+fn cmap_entry(
+    mut primary: ToUnicodeCMap,
+    mut remapped: Option<ToUnicodeCMap>,
+    mut fallback: Option<ToUnicodeCMap>,
+    primary_entries: usize,
+    obj_num: u32,
+    promote: bool,
+) -> CMapEntry {
+    if primary_entries < 10 {
+        if let Some(fb) = fallback.take() {
+            debug!(
+                "ToUnicode CMap obj={} too sparse ({} entries); using fallback",
+                obj_num, primary_entries
+            );
+            remapped = Some(primary);
+            primary = fb;
+        }
+    }
+
+    // When a sequential remap was applied and a TrueType fallback has more
+    // entries than the primary ToUnicode CMap, prefer the TrueType cmap.
+    // Subset fonts number GIDs by document encounter order, so the sorted
+    // sequential remap scrambles characters.  The TrueType cmap table maps
+    // the real GID→Unicode and is authoritative.
+    if promote && remapped.is_some() {
+        if let Some(ref fb) = fallback {
+            let fb_entries = fb.char_map.len() + fb.ranges.len();
+            if fb_entries > primary_entries {
+                debug!(
+                    "ToUnicode CMap obj={}: TrueType fallback ({} entries) > primary ({}); promoting over sequential remap",
+                    obj_num, fb_entries, primary_entries
+                );
+                let old_remap = remapped.take().unwrap();
+                remapped = fallback.take();
+                fallback = Some(old_remap);
+            }
+        }
+    }
+
+    CMapEntry {
+        primary,
+        remapped,
+        fallback,
+    }
+}
+
+/// The codes among `codes` a simple font's `/Differences` name. Such a
+/// font reaches a named code's glyph by the name, whatever its program's
+/// cmap holds at the raw code, so the name says what the code is — a name
+/// of several letters, `f_f`, reads as them; one that spells no character
+/// leaves the code marked — and no reading of the program does. Nothing
+/// for a Type0 font, or a simple font whose encoding is a name or absent.
+fn differences_named_codes(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    codes: &[u16],
+) -> HashSet<u16> {
+    if font_subtype(font_dict) == Some(&b"Type0"[..]) {
+        return HashSet::new();
+    }
+    let Some(encoding) = crate::extractor::fonts::parse_font_encoding(doc, font_dict) else {
+        return HashSet::new();
+    };
+    codes
+        .iter()
+        .copied()
+        .filter(|&code| u8::try_from(code).is_ok_and(|byte| encoding.named_codes.contains(&byte)))
+        .collect()
+}
+
+/// A space for each CID in `codes` whose glyph, in `program` — the
+/// descendant font's embedded program, read once by the caller — has no
+/// outline but an advance (from `/W`, else `/DW`, else 1000): painted, it
+/// leaves a gap and nothing else, whatever the ToUnicode CMap says of it.
+/// The glyph is found by CID through the charset of a CID-keyed CFF
+/// program, else through the CIDToGIDMap, else by the CID itself. Nothing
+/// for a simple font, whose blank glyphs are read at decode time, or for a
+/// program that tells nothing of its outlines (see [`ProgramGlyphs`]) — nor
+/// for one that outlines nothing at all while more than two of the codes
+/// have glyphs within its glyph count: an invisible text layer's font, whose text is kept, as the
+/// simple-font rule (`blank_glyph_codes`) keeps it; up to two such codes
+/// still read as the space of a subset written for a space painted alone.
+fn blank_cid_glyph_spaces(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    program: &[u8],
+    codes: &[u16],
+) -> Vec<(u16, String)> {
+    let Some(cid_font_dict) = get_descendant_cid_font(font_dict, doc) else {
+        return Vec::new();
+    };
+    let Some(glyphs) = ProgramGlyphs::parse(program) else {
+        return Vec::new();
+    };
+    let cid_to_gid = get_cid_to_gid_map(cid_font_dict, doc);
+    // The glyph a CID selects: through the charset of a CID-keyed CFF
+    // program; else through the CIDToGIDMap, when the map has one for it —
+    // a CID past the map's end, or sent to glyph 0, has no glyph of its
+    // own, and its code stays what the CMap says of it; else the CID itself.
+    let glyph_of = |cid: u16| -> Option<u16> {
+        match (&glyphs.charset, cid_to_gid.as_ref()) {
+            (Some(by_cid), _) => by_cid.get(&cid).copied(),
+            (None, None) => Some(cid),
+            (None, Some(map)) => map.get(usize::from(cid)).copied().filter(|&gid| gid != 0),
+        }
+    };
+    let mut with_glyph = 0usize;
+    let blanks: Vec<(u16, String)> = codes
+        .iter()
+        .copied()
+        .filter(|&cid| {
+            // A CID whose index lies past the program's glyph count has no
+            // glyph, whatever the map says, and counts for nothing here.
+            let Some(gid) = glyph_of(cid).filter(|&gid| glyphs.has(gid)) else {
+                return false;
+            };
+            with_glyph += 1;
+            glyphs.blank(gid) && cid_advance(cid_font_dict, doc, cid) > 0.0
+        })
+        .map(|cid| (cid, " ".to_string()))
+        .collect();
+    if !blanks.is_empty() && with_glyph > 2 && !glyphs.any_outline() {
+        return Vec::new();
+    }
+    blanks
+}
+
+/// The glyphs of a CIDFont's embedded program, as far as a blank among
+/// them can be told: an sfnt (TrueType or OpenType) with an outline table,
+/// or a bare CFF program. An sfnt without one — a bitmap-only face, or one
+/// whose outline table does not parse — has no outline to read for any
+/// glyph, and says nothing of blanks.
+struct ProgramGlyphs<'a> {
+    outlines: Outlines<'a>,
+    /// The glyph of each CID in the charset of a CID-keyed CFF program;
+    /// `None` when the program is not CID-keyed, and a CID finds its glyph
+    /// through the CIDToGIDMap.
+    charset: Option<HashMap<u16, u16>>,
+}
+
+/// Where a program keeps its outlines (both boxed: a parsed face is a
+/// large value, and the two variants are kept the same size).
+enum Outlines<'a> {
+    Sfnt(Box<ttf_parser::Face<'a>>),
+    Cff(Box<ttf_parser::cff::Table<'a>>),
+}
+
+impl<'a> ProgramGlyphs<'a> {
+    fn parse(program: &'a [u8]) -> Option<Self> {
+        let (outlines, cff) = if let Ok(face) = ttf_parser::Face::parse(program, 0) {
+            let tables = face.tables();
+            if tables.glyf.is_none() && tables.cff.is_none() && tables.cff2.is_none() {
+                return None;
+            }
+            let cff = tables.cff;
+            (Outlines::Sfnt(Box::new(face)), cff)
+        } else {
+            let cff = ttf_parser::cff::Table::parse(program)?;
+            (Outlines::Cff(Box::new(cff)), Some(cff))
+        };
+        let charset = cff
+            .filter(|cff| cff.glyph_cid(ttf_parser::GlyphId(0)).is_some())
+            .map(|cff| cff_cid_to_gid(&cff));
+        Some(Self { outlines, charset })
+    }
+
+    /// Whether the program has a glyph at `gid`: an index below its glyph
+    /// count.
+    fn has(&self, gid: u16) -> bool {
+        match &self.outlines {
+            Outlines::Sfnt(face) => gid < face.number_of_glyphs(),
+            Outlines::Cff(cff) => gid < cff.number_of_glyphs(),
+        }
+    }
+
+    /// Whether any glyph of the program has an outline. A program with none
+    /// is an invisible text layer's, or a subset holding a lone blank glyph.
+    fn any_outline(&self) -> bool {
+        match &self.outlines {
+            Outlines::Sfnt(face) => (0..face.number_of_glyphs())
+                .any(|gid| face.glyph_bounding_box(ttf_parser::GlyphId(gid)).is_some()),
+            Outlines::Cff(cff) => (0..cff.number_of_glyphs()).any(|gid| {
+                cff.outline(ttf_parser::GlyphId(gid), &mut NoOutline)
+                    .is_ok()
+            }),
+        }
+    }
+
+    /// Whether glyph `gid` has no outline. An index at or past the
+    /// program's glyph count is no glyph, and its outline, unread, says
+    /// nothing of a blank.
+    fn blank(&self, gid: u16) -> bool {
+        let glyph = ttf_parser::GlyphId(gid);
+        match &self.outlines {
+            Outlines::Sfnt(face) => {
+                gid < face.number_of_glyphs() && face.glyph_bounding_box(glyph).is_none()
+            }
+            Outlines::Cff(cff) => {
+                gid < cff.number_of_glyphs()
+                    && matches!(
+                        cff.outline(glyph, &mut NoOutline),
+                        Err(ttf_parser::CFFError::ZeroBBox)
+                    )
+            }
+        }
+    }
+}
+
+/// An outline sink that keeps nothing: only whether a glyph has one is asked.
+struct NoOutline;
+
+impl ttf_parser::OutlineBuilder for NoOutline {
+    fn move_to(&mut self, _x: f32, _y: f32) {}
+    fn line_to(&mut self, _x: f32, _y: f32) {}
+    fn quad_to(&mut self, _x1: f32, _y1: f32, _x: f32, _y: f32) {}
+    fn curve_to(&mut self, _x1: f32, _y1: f32, _x2: f32, _y2: f32, _x: f32, _y: f32) {}
+    fn close(&mut self) {}
+}
+
+/// The glyph of each CID in a CID-keyed CFF program's charset, read once
+/// for all the codes a repair looks up.
+fn cff_cid_to_gid(cff: &ttf_parser::cff::Table<'_>) -> HashMap<u16, u16> {
+    (0..cff.number_of_glyphs())
+        .filter_map(|gid| {
+            cff.glyph_cid(ttf_parser::GlyphId(gid))
+                .map(|cid| (cid, gid))
+        })
+        .collect()
+}
+
+/// The embedded program (`FontFile2` or `FontFile3`) the descriptor of
+/// `font` names, decompressed — or as the stream holds it when its content
+/// does not decompress, or decompresses to nothing (a filter the decoder
+/// cannot apply, or one declared over bytes that are in fact plain), as
+/// the loaders before this one read it.
+fn font_program(font: &lopdf::Dictionary, doc: &Document) -> Option<Vec<u8>> {
+    let descriptor = match font.get(b"FontDescriptor").ok()? {
+        Object::Reference(r) => doc.get_dictionary(*r).ok()?,
+        Object::Dictionary(d) => d,
+        _ => return None,
+    };
+    let font_file = [&b"FontFile2"[..], &b"FontFile3"[..]]
+        .into_iter()
+        .find_map(|key| descriptor.get(key).ok().and_then(|o| o.as_reference().ok()))?;
+    let stream = doc.get_object(font_file).ok()?.as_stream().ok()?;
+    Some(match stream.decompressed_content() {
+        Ok(data) if !data.is_empty() => data,
+        _ => stream.content.clone(),
+    })
+}
+
+/// The font's `/Subtype` name.
+fn font_subtype(font_dict: &lopdf::Dictionary) -> Option<&[u8]> {
+    font_dict.get(b"Subtype").ok()?.as_name().ok()
+}
+
+/// The descendant CIDFont of a Type0 font under Identity-H or Identity-V:
+/// the fonts whose codes are glyph indices, which an embedded program can
+/// be read by.
+fn identity_type0_descendant<'a>(
+    font_dict: &'a lopdf::Dictionary,
+    doc: &'a Document,
+) -> Option<&'a lopdf::Dictionary> {
+    // The encoding as named, written in place or as an indirect name object.
+    let encoding = match font_dict.get(b"Encoding").ok()? {
+        Object::Reference(r) => doc.get_object(*r).ok()?,
+        other => other,
+    };
+    let encoding = encoding.as_name().ok()?;
+    if encoding != b"Identity-H" && encoding != b"Identity-V" {
+        return None;
+    }
+    get_descendant_cid_font(font_dict, doc)
+}
+
+/// The embedded program a font's fallback CMap and the repair of its
+/// control destinations read, decompressed once for both: a simple font's
+/// own, an Identity-H or Identity-V Type0 font's descendant's. None for a
+/// Type0 font under another encoding, whose codes are not glyph indices.
+fn embedded_font_program(font_dict: &lopdf::Dictionary, doc: &Document) -> Option<Vec<u8>> {
+    match font_subtype(font_dict)? {
+        b"Type0" => font_program(identity_type0_descendant(font_dict, doc)?, doc),
+        _ => font_program(font_dict, doc),
+    }
+}
+
+/// A font's embedded program (see [`embedded_font_program`]), decompressed
+/// and read on first need and at most once, for all that a CMap entry
+/// takes from it: the fallback of a sparse CMap, and the reading and the
+/// outlines a control-destination repair looks at.
+struct LazyProgram<'a> {
+    font_dict: &'a lopdf::Dictionary,
+    doc: &'a Document,
+    bytes: std::cell::OnceCell<Option<Vec<u8>>>,
+    reading: std::cell::OnceCell<Option<ToUnicodeCMap>>,
+}
+
+impl<'a> LazyProgram<'a> {
+    fn new(font_dict: &'a lopdf::Dictionary, doc: &'a Document) -> Self {
+        Self {
+            font_dict,
+            doc,
+            bytes: std::cell::OnceCell::new(),
+            reading: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The program's bytes, read now if they were not yet.
+    fn bytes(&self) -> Option<&[u8]> {
+        self.bytes
+            .get_or_init(|| embedded_font_program(self.font_dict, self.doc))
+            .as_deref()
+    }
+
+    /// The fallback CMap the program yields (see [`program_fallback_cmap`]),
+    /// built now if it was not yet.
+    fn reading(&self) -> Option<&ToUnicodeCMap> {
+        self.reading
+            .get_or_init(|| program_fallback_cmap(self.font_dict, self.doc, self.bytes()))
+            .as_ref()
+    }
+}
+
+/// How a font's CMap entry is built from its parsed ToUnicode CMap (see
+/// [`font_cmap_entry`]).
+#[derive(Clone, Copy)]
+struct EntryBuild {
+    /// Whether a fallback with more entries than the ToUnicode CMap is
+    /// promoted over a subset remap (see [`cmap_entry`]).
+    promote: bool,
+    /// When the embedded program's reading serves as the fallback, where
+    /// the CID collection gives none.
+    program_fallback: ProgramFallback,
+    /// Whether the repair of the control destinations may read the
+    /// program: its reading, and its outlines.
+    program_repair: bool,
+}
+
+/// When a font's embedded program is read for the fallback of its CMap
+/// entry.
+#[derive(Clone, Copy)]
+enum ProgramFallback {
+    /// Whatever the ToUnicode CMap holds.
+    Always,
+    /// Only for a sparse ToUnicode CMap — fewer than ten entries.
+    WhenSparse,
+    /// Not at all.
+    Never,
+}
+
+/// The CMap entry of a font from `cmap`, its parsed ToUnicode CMap: the
+/// CMap and its subset remap when [`try_remap_subset_cmap`] makes one, the
+/// fallback — the CID collection's reading, else the program's as `build`
+/// allows — and the repair of the control destinations
+/// ([`repair_control_destinations`]), each in the role [`cmap_entry`]
+/// gives it. The program is decompressed at most once, on first need, for
+/// all that is taken from it.
+fn font_cmap_entry(
+    cmap: ToUnicodeCMap,
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    obj_num: u32,
+    build: EntryBuild,
+) -> CMapEntry {
+    let (mut primary, mut remapped) = try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
+    let primary_entries = primary.char_map.len() + primary.ranges.len();
+    let sparse = primary_entries < 10;
+    let program = LazyProgram::new(font_dict, doc);
+    let encoding_fallback = build_fallback_tounicode_from_encoding(font_dict, doc);
+    let program_fallback = match build.program_fallback {
+        ProgramFallback::Always => true,
+        ProgramFallback::WhenSparse => sparse,
+        ProgramFallback::Never => false,
+    };
+    // Whether the program's reading is the fallback: the repair then has
+    // it there, and does not ask for it again.
+    let program_read = program_fallback && encoding_fallback.is_none();
+    let fallback = encoding_fallback.or_else(|| {
+        program_fallback
+            .then(|| program.reading().cloned())
+            .flatten()
+    });
+    // The repair runs before the roles are decided, on the ToUnicode CMap
+    // and on its remap alike: the font's strings decide between the two
+    // readings by their text (the original first, see the decision cache
+    // at decode time), and the fallback — the font's own reading — is
+    // keyed like whichever of them is right, so each is repaired from the
+    // same sources, and what was fixed moves with it into whichever role
+    // it takes.
+    for target in std::iter::once(&mut primary).chain(remapped.as_mut()) {
+        repair_control_destinations(
+            target,
+            fallback.as_ref(),
+            || {
+                (build.program_repair && !program_read)
+                    .then(|| program.reading())
+                    .flatten()
+            },
+            || build.program_repair.then(|| program.bytes()).flatten(),
+            font_dict,
+            doc,
+        );
+    }
+    cmap_entry(
+        primary,
+        remapped,
+        fallback,
+        primary_entries,
+        obj_num,
+        build.promote,
+    )
+}
+
+/// The fallback CMap a font's embedded program yields, `program` being
+/// what [`embedded_font_program`] read: for a Type0 font under Identity-H
+/// or Identity-V, its descendant's program read by glyph index, repaired
+/// through the CIDToGIDMap when there is one, else the mapping of its CID
+/// collection; for a simple font, its own program read by code.
+fn program_fallback_cmap(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    program: Option<&[u8]>,
+) -> Option<ToUnicodeCMap> {
+    if font_subtype(font_dict)? == b"Type0" {
+        let cid_font_dict = identity_type0_descendant(font_dict, doc)?;
+        if let Some(cmap) = program.and_then(build_cmap_from_truetype) {
+            if let Some(cid_to_gid) = get_cid_to_gid_map(cid_font_dict, doc) {
+                if let Some(repaired) = build_cmap_with_cid_to_gid_map(&cmap, &cid_to_gid) {
+                    debug!(
+                        "Fallback TrueType CMap repaired with CIDToGIDMap: {} entries",
+                        repaired.char_map.len()
+                    );
+                    return Some(repaired);
+                }
+            }
+            debug!(
+                "Fallback TrueType CMap (Type0+ToUnicode) char_map={}",
+                cmap.char_map.len()
+            );
+            return Some(cmap);
+        }
+        let cmap = build_cmap_from_cid_system_info(cid_font_dict, doc)?;
+        debug!(
+            "Fallback CIDSystemInfo CMap (Type0+ToUnicode) char_map={}",
+            cmap.char_map.len()
+        );
+        Some(cmap)
+    } else {
+        let cmap = build_simple_cmap_from_truetype(program?)?;
+        debug!(
+            "Fallback simple font cmap (ToUnicode present) char_map={}",
+            cmap.char_map.len()
+        );
+        Some(cmap)
+    }
+}
+
+/// The advance a CIDFont gives `cid`: its `/W` entry, else `/DW`, else the
+/// default of 1000.
+fn cid_advance(cid_font_dict: &lopdf::Dictionary, doc: &Document, cid: u16) -> f64 {
+    w_array_width(cid_font_dict, doc, cid).unwrap_or_else(|| {
+        cid_font_dict
+            .get(b"DW")
+            .ok()
+            .and_then(|o| match o {
+                Object::Reference(r) => doc.get_object(*r).ok().and_then(object_number),
+                other => object_number(other),
+            })
+            .unwrap_or(1000.0)
+    })
+}
+
+fn object_number(o: &Object) -> Option<f64> {
+    match o {
+        Object::Integer(n) => Some(*n as f64),
+        Object::Real(n) => Some(f64::from(*n)),
+        _ => None,
+    }
+}
+
 pub(crate) fn build_cmap_entry_from_stream(
     data: &[u8],
     font_dict: &lopdf::Dictionary,
@@ -143,48 +751,17 @@ pub(crate) fn build_cmap_entry_from_stream(
     obj_num: u32,
 ) -> Option<CMapEntry> {
     if let Some(cmap) = ToUnicodeCMap::parse(data) {
-        let (mut primary, mut remapped) = try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
-        let mut fallback = build_fallback_tounicode_from_encoding(font_dict, doc)
-            .or_else(|| build_fallback_cmap_for_type0(font_dict, doc))
-            .or_else(|| build_fallback_cmap_for_simple(font_dict, doc));
-
-        let primary_entries = primary.char_map.len() + primary.ranges.len();
-        if primary_entries < 10 {
-            if let Some(fb) = fallback.take() {
-                debug!(
-                    "ToUnicode CMap obj={} too sparse ({} entries); using fallback",
-                    obj_num, primary_entries
-                );
-                remapped = Some(primary);
-                primary = fb;
-            }
-        }
-
-        // When a sequential remap was applied and a TrueType fallback has more
-        // entries than the primary ToUnicode CMap, prefer the TrueType cmap.
-        // Subset fonts number GIDs by document encounter order, so the sorted
-        // sequential remap scrambles characters.  The TrueType cmap table maps
-        // the real GID→Unicode and is authoritative.
-        if remapped.is_some() {
-            if let Some(ref fb) = fallback {
-                let fb_entries = fb.char_map.len() + fb.ranges.len();
-                if fb_entries > primary_entries {
-                    debug!(
-                        "ToUnicode CMap obj={}: TrueType fallback ({} entries) > primary ({}); promoting over sequential remap",
-                        obj_num, fb_entries, primary_entries
-                    );
-                    let old_remap = remapped.take().unwrap();
-                    remapped = fallback.take();
-                    fallback = Some(old_remap);
-                }
-            }
-        }
-
-        return Some(CMapEntry {
-            primary,
-            remapped,
-            fallback,
-        });
+        return Some(font_cmap_entry(
+            cmap,
+            font_dict,
+            doc,
+            obj_num,
+            EntryBuild {
+                promote: true,
+                program_fallback: ProgramFallback::Always,
+                program_repair: true,
+            },
+        ));
     }
 
     let fallback = build_fallback_cmap_for_type0(font_dict, doc)
@@ -503,8 +1080,74 @@ impl ToUnicodeCMap {
         }
     }
 
-    /// Look up a CID and return the Unicode string
+    /// Look up a CID and return the Unicode string: `None` for a code the
+    /// CMap has no entry for, and for one whose entry is a control
+    /// destination, which maps it to no text (see [`CodeMapping`]).
     pub fn lookup(&self, cid: u16) -> Option<String> {
+        match self.lookup_code(cid) {
+            CodeMapping::Text(text) => Some(text),
+            CodeMapping::ControlDestination | CodeMapping::Unmapped => None,
+        }
+    }
+
+    /// What the CMap says about a code: its text, that its entry is a
+    /// control destination, or that it has no entry.
+    pub(crate) fn lookup_code(&self, cid: u16) -> CodeMapping {
+        match self.destination(cid) {
+            Some(text) if destination_is_control(&text) => CodeMapping::ControlDestination,
+            Some(text) => CodeMapping::Text(text),
+            None => CodeMapping::Unmapped,
+        }
+    }
+
+    /// The codes whose entries are control destinations that a repair
+    /// chases, in order: the `char_map` entries that hold one, and the
+    /// members of a range whose destinations lie in the control block, or
+    /// are the one DEL, that resolve to one, as [`Self::lookup_code`] reads
+    /// them. A range that sweeps through the block on its way to printable
+    /// destinations — an identity range, as a text layer's CMap writes — is
+    /// left out: the members that land on a control are misses at lookup
+    /// all the same, but no text uses them where the range is right, and
+    /// where it is wrong as a whole, thirty mended entries mend nothing; the
+    /// program is not read for them.
+    pub(crate) fn control_destination_codes(&self) -> Vec<u16> {
+        let mut codes: std::collections::BTreeSet<u16> = self
+            .char_map
+            .iter()
+            .filter(|(_, text)| destination_is_control(text))
+            .map(|(&code, _)| code)
+            .collect();
+        for &(start, end, base) in &self.ranges {
+            if start > end || !destination_span_is_control_block(base, u32::from(end - start)) {
+                continue;
+            }
+            for code in start..=end {
+                if matches!(self.lookup_code(code), CodeMapping::ControlDestination) {
+                    codes.insert(code);
+                }
+            }
+        }
+        codes.into_iter().collect()
+    }
+
+    /// Give `codes` — control destinations of this CMap — the text `source`
+    /// has for them: the font's own reading of the same codes. Every other
+    /// entry is left alone, and a code `source` cannot read stays a
+    /// control destination.
+    fn recover_codes(&mut self, codes: &[u16], source: &ToUnicodeCMap) {
+        for &code in codes {
+            if let Some(text) = source
+                .lookup(code)
+                .filter(|text| !text.is_empty() && !text.contains('\u{FFFD}'))
+            {
+                self.char_map.insert(code, text);
+            }
+        }
+    }
+
+    /// The destination the CMap holds for a code, whatever it says: a
+    /// `char_map` entry first, else the range the code falls in.
+    fn destination(&self, cid: u16) -> Option<String> {
         // First check direct mappings
         if let Some(s) = self.char_map.get(&cid) {
             return Some(s.clone());
@@ -542,7 +1185,9 @@ impl ToUnicodeCMap {
     }
 
     /// Per-byte CMap lookup without Latin-1 fallback.
-    /// Returns `(raw_byte, Option<cmap_result>)` for each byte.
+    /// Returns `(raw_byte, Option<cmap_result>)` for each byte; a code whose
+    /// entry is a control destination is a miss, like an unmapped one, for
+    /// the caller to read through its other CMaps before marking it.
     /// Only meaningful for single-byte (code_byte_length==1) CMaps.
     pub fn lookup_bytes(&self, bytes: &[u8]) -> Vec<(u8, Option<String>)> {
         bytes
@@ -578,10 +1223,14 @@ impl ToUnicodeCMap {
     /// the Latin-1 character of a single byte, a CID passed through as a
     /// code point, the character read into a gap of a two-byte CMap
     /// ([`Self::gap_fill`]) or the U+FFFD of a two-byte code that cannot be
-    /// read — is one character and goes in as it is). Returns the text
+    /// read — is one character and goes in as it is, as does the U+FFFD a
+    /// code whose entry is a control destination reads as). Returns the text
     /// with the number of codes that contributed to it and the decode's
     /// counts: an empty text and no contributing code when too many codes
-    /// were unmapped, the counts either way.
+    /// were unmapped, the counts either way. A code whose entry is a control
+    /// destination counts as unmapped, but not towards abandoning the text:
+    /// its U+FFFD is the CMap's own reading of the code, not a sign that the
+    /// CMap is the wrong reading of the string.
     pub(crate) fn decode_cids_with(
         &self,
         bytes: &[u8],
@@ -590,16 +1239,23 @@ impl ToUnicodeCMap {
         let mut result = String::new();
         let mut stats = CidDecodeStats::default();
         let mut contributing = 0usize;
+        let mut control_destinations = 0u32;
 
         if self.code_byte_length == 1 {
             // Single-byte codes: each byte is a code
             for &b in bytes {
                 stats.codes += 1;
                 let code = b as u16;
-                match self.lookup(code) {
-                    Some(s) if !s.contains('\u{FFFD}') => {
+                match self.lookup_code(code) {
+                    CodeMapping::Text(s) if !s.contains('\u{FFFD}') => {
                         append(&mut result, &s);
                         contributing += 1;
+                    }
+                    CodeMapping::ControlDestination => {
+                        result.push('\u{FFFD}');
+                        contributing += 1;
+                        stats.unmapped += 1;
+                        control_destinations += 1;
                     }
                     _ => {
                         // For single-byte unmapped codes, try as Latin-1
@@ -618,10 +1274,16 @@ impl ToUnicodeCMap {
                 if chunk.len() == 2 {
                     stats.codes += 1;
                     let cid = u16::from_be_bytes([chunk[0], chunk[1]]);
-                    match self.lookup(cid) {
-                        Some(s) if !s.contains('\u{FFFD}') => {
+                    match self.lookup_code(cid) {
+                        CodeMapping::Text(s) if !s.contains('\u{FFFD}') => {
                             append(&mut result, &s);
                             contributing += 1;
+                        }
+                        CodeMapping::ControlDestination => {
+                            result.push('\u{FFFD}');
+                            contributing += 1;
+                            stats.unmapped += 1;
+                            control_destinations += 1;
                         }
                         _ => {
                             if self.cid_passthrough {
@@ -658,8 +1320,10 @@ impl ToUnicodeCMap {
         }
 
         // If too many codes were unmapped, signal failure by returning empty
-        // so the caller can fall through to other decoding methods
-        if stats.codes > 0 && stats.unmapped > stats.codes / 2 {
+        // so the caller can fall through to other decoding methods. A code
+        // whose entry is a control destination is read, as U+FFFD, by the
+        // CMap itself: it does not count against the reading.
+        if stats.codes > 0 && stats.unmapped - control_destinations > stats.codes / 2 {
             return CidDecoding {
                 text: String::new(),
                 contributing: 0,
@@ -1093,16 +1757,34 @@ fn get_w_array_start_cid(cid_font_dict: &lopdf::Dictionary, doc: &Document) -> O
 ///   1. `c [w1 w2 ... wn]` — widths for CIDs c, c+1, ..., c+n-1
 ///   2. `c_first c_last w` — CIDs c_first..c_last all have width w
 fn w_array_covers_cid(cid_font_dict: &lopdf::Dictionary, doc: &Document, target: u16) -> bool {
-    let Ok(w_obj) = cid_font_dict.get(b"W") else {
-        return false;
-    };
+    w_array_lookup(cid_font_dict, doc, target).is_some()
+}
+
+/// The width the CIDFont's `/W` array gives `target`, when it lists the
+/// CID and the width reads as a number; a listed CID whose width token
+/// does not (a name, a string) has no width here, and `cid_advance` falls
+/// through to `/DW`.
+fn w_array_width(cid_font_dict: &lopdf::Dictionary, doc: &Document, target: u16) -> Option<f64> {
+    w_array_lookup(cid_font_dict, doc, target).flatten()
+}
+
+/// The `/W` array's entry for `target`: `None` when no entry lists the
+/// CID, `Some(None)` when one does but its width token does not read as a
+/// number, `Some(Some(width))` otherwise. Coverage and width are told
+/// apart so that a spec-invalid width token still counts as a listed CID.
+fn w_array_lookup(
+    cid_font_dict: &lopdf::Dictionary,
+    doc: &Document,
+    target: u16,
+) -> Option<Option<f64>> {
+    let w_obj = cid_font_dict.get(b"W").ok()?;
     let arr = match w_obj {
         Object::Array(arr) => arr,
         Object::Reference(r) => match doc.get_object(*r) {
             Ok(Object::Array(arr)) => arr,
-            _ => return false,
+            _ => return None,
         },
-        _ => return false,
+        _ => return None,
     };
 
     let resolve_int = |o: &Object| -> Option<i64> {
@@ -1113,6 +1795,13 @@ fn w_array_covers_cid(cid_font_dict: &lopdf::Dictionary, doc: &Document, target:
                 _ => None,
             },
             _ => None,
+        }
+    };
+
+    let resolve_num = |o: &Object| -> Option<f64> {
+        match o {
+            Object::Reference(r) => doc.get_object(*r).ok().and_then(object_number),
+            other => object_number(other),
         }
     };
 
@@ -1142,24 +1831,28 @@ fn w_array_covers_cid(cid_font_dict: &lopdf::Dictionary, doc: &Document, target:
             // Format 1: c [w1 ... wn]
             let last = first + widths.len() as i64 - 1;
             if target >= first && target <= last {
-                return true;
+                return Some(resolve_num(&widths[(target - first) as usize]));
             }
             i += 1;
         } else if let Some(last) = resolve_int(&arr[i]) {
             // Format 2: c_first c_last w
             i += 1;
-            if i < arr.len() {
-                i += 1; // skip the width value
-            }
+            let width = if i < arr.len() {
+                let width = resolve_num(&arr[i]);
+                i += 1;
+                width
+            } else {
+                None
+            };
             if target >= first && target <= last {
-                return true;
+                return Some(width);
             }
         } else {
             // Unknown token — abort parsing safely
             break;
         }
     }
-    false
+    None
 }
 
 /// Extract CIDToGIDMap as a vector of GIDs (u16) indexed by CID.
@@ -1194,7 +1887,9 @@ fn build_cmap_with_cid_to_gid_map(
 ) -> Option<ToUnicodeCMap> {
     let mut new_cmap = ToUnicodeCMap::new();
     for (cid, &gid) in cid_to_gid.iter().enumerate() {
-        if let Some(s) = cmap.lookup(gid) {
+        // The destination as written, so that a control destination stays
+        // one under its new key rather than turning into a missing entry.
+        if let Some(s) = cmap.destination(gid) {
             new_cmap.char_map.insert(cid as u16, s);
         }
     }
@@ -2453,52 +3148,33 @@ impl FontCMaps {
                     cmap.char_map.len(),
                     cmap.ranges.len()
                 );
-                let (mut primary, mut remapped) =
-                    try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
-
                 // Only build expensive fallbacks when the primary CMap is sparse.
                 // build_fallback_cmap_for_type0 can take seconds on large embedded
                 // TrueType fonts (decompressing + parsing 100K+ byte font files).
-                // Skip entirely when the primary CMap is sufficient.
-                let primary_entries = primary.char_map.len() + primary.ranges.len();
-                let mut fallback = if primary_entries < 10 && !skip_truetype_fallback {
-                    // Try cheap fallback first; only attempt expensive TrueType
-                    // parsing if cheap fallbacks don't yield results.
-                    let cheap = build_fallback_tounicode_from_encoding(font_dict, doc)
-                        .or_else(|| build_fallback_cmap_for_simple(font_dict, doc));
-                    if cheap.is_some() {
-                        cheap
-                    } else {
-                        build_fallback_cmap_for_type0(font_dict, doc)
-                    }
-                } else if primary_entries < 10 {
-                    // Fast mode: only try cheap fallbacks, skip TrueType parsing.
-                    // Regions using this font will get needs_ocr=true.
-                    build_fallback_tounicode_from_encoding(font_dict, doc)
-                        .or_else(|| build_fallback_cmap_for_simple(font_dict, doc))
-                } else {
-                    // Primary is rich enough; only try the cheap encoding fallback
-                    build_fallback_tounicode_from_encoding(font_dict, doc)
-                };
-
-                if primary_entries < 10 {
-                    if let Some(fb) = fallback.take() {
-                        debug!(
-                            "ToUnicode CMap obj={} too sparse ({} entries); using fallback",
-                            obj_num, primary_entries
-                        );
-                        remapped = Some(primary);
-                        primary = fb;
-                    }
-                }
-                by_obj_num.insert(
+                // Skip entirely when the primary CMap is sufficient. A sparse
+                // CMap takes the cheap fallback first — the CID collection's,
+                // else a simple font's program — and a Type0 font's program
+                // only outside fast mode, which leaves that parsing to the
+                // regions it sends to OCR; fast mode leaves the program to
+                // them for the repair of the control destinations too, whose
+                // codes stay marked.
+                let is_type0 = font_subtype(font_dict) == Some(&b"Type0"[..]);
+                let entry = font_cmap_entry(
+                    cmap,
+                    font_dict,
+                    doc,
                     obj_num,
-                    CMapEntry {
-                        primary,
-                        remapped,
-                        fallback,
+                    EntryBuild {
+                        promote: false,
+                        program_fallback: if skip_truetype_fallback && is_type0 {
+                            ProgramFallback::Never
+                        } else {
+                            ProgramFallback::WhenSparse
+                        },
+                        program_repair: !skip_truetype_fallback,
                     },
                 );
+                by_obj_num.insert(obj_num, entry);
             } else {
                 // ToUnicode present but parse failed; try fallbacks to avoid empty decoding.
                 let fallback = if skip_truetype_fallback {
@@ -2883,132 +3559,32 @@ impl FontCMaps {
 
 /// For Type0 CID fonts, try to build a fallback CMap from embedded font data
 /// or CIDSystemInfo when a ToUnicode CMap is present but incomplete.
+/// The fallback CMap of a Type0 font under Identity-H or Identity-V, from
+/// its descendant's embedded program or its CID collection (see
+/// [`program_fallback_cmap`]); None for any other font.
 fn build_fallback_cmap_for_type0(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
 ) -> Option<ToUnicodeCMap> {
-    let subtype = font_dict.get(b"Subtype").ok()?.as_name().ok()?;
-    if subtype != b"Type0" {
+    if font_subtype(font_dict)? != b"Type0" {
         return None;
     }
-    let encoding = font_dict
-        .get(b"Encoding")
-        .ok()
-        .and_then(|o| o.as_name().ok())?;
-    if encoding != b"Identity-H" && encoding != b"Identity-V" {
-        return None;
-    }
-
-    let desc_fonts_obj = font_dict.get(b"DescendantFonts").ok()?;
-    let desc_fonts = match desc_fonts_obj {
-        Object::Array(arr) => arr,
-        Object::Reference(r) => match doc.get_object(*r) {
-            Ok(Object::Array(arr)) => arr,
-            _ => return None,
-        },
-        _ => return None,
-    };
-    if desc_fonts.is_empty() {
-        return None;
-    }
-    let cid_font_dict = match &desc_fonts[0] {
-        Object::Reference(r) => doc.get_dictionary(*r).ok()?,
-        Object::Dictionary(d) => d,
-        _ => return None,
-    };
-
-    let font_descriptor = cid_font_dict
-        .get(b"FontDescriptor")
-        .ok()
-        .and_then(|o| match o {
-            Object::Reference(r) => doc.get_dictionary(*r).ok(),
-            Object::Dictionary(d) => Some(d),
-            _ => None,
-        });
-
-    let font_file_ref = font_descriptor.and_then(|fd| {
-        fd.get(b"FontFile2")
-            .ok()
-            .and_then(|o| o.as_reference().ok())
-            .or_else(|| {
-                fd.get(b"FontFile3")
-                    .ok()
-                    .and_then(|o| o.as_reference().ok())
-            })
-    });
-
-    if let Some(ff_ref) = font_file_ref {
-        if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
-            if let Ok(data) = stream.decompressed_content() {
-                if let Some(cmap) = build_cmap_from_truetype(&data) {
-                    if let Some(cid_to_gid) = get_cid_to_gid_map(cid_font_dict, doc) {
-                        if let Some(repaired) = build_cmap_with_cid_to_gid_map(&cmap, &cid_to_gid) {
-                            debug!(
-                                "Fallback TrueType CMap repaired with CIDToGIDMap: {} entries",
-                                repaired.char_map.len()
-                            );
-                            return Some(repaired);
-                        }
-                    }
-                    debug!(
-                        "Fallback TrueType CMap (Type0+ToUnicode) char_map={}",
-                        cmap.char_map.len()
-                    );
-                    return Some(cmap);
-                }
-            }
-        }
-    }
-
-    if let Some(cmap) = build_cmap_from_cid_system_info(cid_font_dict, doc) {
-        debug!(
-            "Fallback CIDSystemInfo CMap (Type0+ToUnicode) char_map={}",
-            cmap.char_map.len()
-        );
-        return Some(cmap);
-    }
-
-    None
+    let program = embedded_font_program(font_dict, doc);
+    program_fallback_cmap(font_dict, doc, program.as_deref())
 }
 
+/// The fallback CMap of a simple font from its embedded program (see
+/// [`program_fallback_cmap`]); None for a Type0 font, or a font without a
+/// program.
 fn build_fallback_cmap_for_simple(
     font_dict: &lopdf::Dictionary,
     doc: &Document,
 ) -> Option<ToUnicodeCMap> {
-    let subtype = font_dict.get(b"Subtype").ok()?.as_name().ok()?;
-    if subtype == b"Type0" {
+    if font_subtype(font_dict)? == b"Type0" {
         return None;
     }
-    let font_descriptor = font_dict
-        .get(b"FontDescriptor")
-        .ok()
-        .and_then(|o| match o {
-            Object::Reference(r) => doc.get_dictionary(*r).ok(),
-            Object::Dictionary(d) => Some(d),
-            _ => None,
-        })?;
-    let font_file_ref = font_descriptor
-        .get(b"FontFile2")
-        .ok()
-        .and_then(|o| o.as_reference().ok())
-        .or_else(|| {
-            font_descriptor
-                .get(b"FontFile3")
-                .ok()
-                .and_then(|o| o.as_reference().ok())
-        })?;
-    if let Ok(stream) = doc.get_object(font_file_ref).and_then(Object::as_stream) {
-        if let Ok(data) = stream.decompressed_content() {
-            if let Some(cmap) = build_simple_cmap_from_truetype(&data) {
-                debug!(
-                    "Fallback simple font cmap (ToUnicode present) char_map={}",
-                    cmap.char_map.len()
-                );
-                return Some(cmap);
-            }
-        }
-    }
-    None
+    let program = embedded_font_program(font_dict, doc)?;
+    program_fallback_cmap(font_dict, doc, Some(&program))
 }
 
 #[cfg(test)]
@@ -3295,6 +3871,478 @@ endbfchar
         assert_eq!(cmap.lookup(0x22), Some("––".to_string()));
         assert_eq!(cmap.lookup(0x23), Some(" \u{00a0}".to_string()));
         assert_eq!(cmap.lookup(0x24), Some("fi".to_string()));
+    }
+
+    /// A producer that writes a glyph's own index in place of its
+    /// character: the ligature at code 3 gets `<0003> <0003>`.
+    const LIGATURE_INDEX_CMAP: &str = r#"
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+4 beginbfchar
+<0001> <0063>
+<0002> <006F>
+<0003> <0003>
+<0004> <0065>
+endbfchar
+"#;
+    /// "coffee" through [`LIGATURE_INDEX_CMAP`]: c, o, the ligature, e, e.
+    const LIGATURE_INDEX_CODES: [u8; 10] = [0, 1, 0, 2, 0, 3, 0, 4, 0, 4];
+
+    /// A destination of nothing but NUL — `<0000>`, the index of glyph 0
+    /// written as its own destination — is a control destination, where NUL
+    /// padding inside a longer destination (`<00000041>`) still spells its
+    /// character, and an empty destination is neither.
+    #[test]
+    fn an_all_nul_destination_is_a_control_destination() {
+        assert!(destination_is_control("\0"));
+        assert!(destination_is_control("\0\0"));
+        assert!(!destination_is_control("\0A"));
+        assert!(!destination_is_control(""));
+        let cmap = ToUnicodeCMap::parse(
+            b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+              3 beginbfchar\n<0001> <0000>\n<0002> <00000041>\n<0003> <0041>\nendbfchar",
+        )
+        .unwrap();
+        assert!(matches!(
+            cmap.lookup_code(1),
+            CodeMapping::ControlDestination
+        ));
+        assert!(matches!(cmap.lookup_code(2), CodeMapping::Text(ref t) if t.contains('A')));
+        assert!(matches!(cmap.lookup_code(3), CodeMapping::Text(ref t) if t == "A"));
+    }
+
+    #[test]
+    fn a_control_destination_is_a_miss_not_text() {
+        let cmap = ToUnicodeCMap::parse(LIGATURE_INDEX_CMAP.as_bytes()).unwrap();
+        assert_eq!(cmap.lookup(3), None);
+        assert_eq!(cmap.lookup_code(3), CodeMapping::ControlDestination);
+        assert_eq!(cmap.lookup_code(1), CodeMapping::Text("c".to_string()));
+        assert_eq!(cmap.lookup_code(9), CodeMapping::Unmapped);
+        assert_eq!(cmap.control_destination_codes(), [3]);
+        // The code reads as U+FFFD in its place rather than as U+0003,
+        // which a later pass strips, leaving "coee" and no trace of a loss.
+        assert_eq!(cmap.decode_cids(&LIGATURE_INDEX_CODES), "co\u{FFFD}ee");
+    }
+
+    #[test]
+    fn a_range_member_that_resolves_to_a_control_is_a_miss() {
+        // Members of a range resolve one by one: those landing on TAB, LF
+        // and CR stay text, those landing on VT, FF or DEL are misses, and
+        // the range's other members read as before. The repair chases the
+        // misses of the two ranges that lie in the control block; the third
+        // reaches DEL from `~`, and its miss is left as it is.
+        let cmap_content = r#"
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+3 beginbfrange
+<0010> <0012> <0009>
+<0020> <0021> <000C>
+<0030> <0031> <007E>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+        assert_eq!(cmap.lookup(0x10), Some("\t".to_string()));
+        assert_eq!(cmap.lookup(0x11), Some("\n".to_string()));
+        assert_eq!(cmap.lookup_code(0x12), CodeMapping::ControlDestination);
+        assert_eq!(cmap.lookup_code(0x20), CodeMapping::ControlDestination);
+        assert_eq!(cmap.lookup(0x21), Some("\r".to_string()));
+        assert_eq!(cmap.lookup(0x30), Some("~".to_string()));
+        assert_eq!(cmap.lookup_code(0x31), CodeMapping::ControlDestination);
+        assert_eq!(cmap.lookup_code(0x13), CodeMapping::Unmapped);
+        assert_eq!(cmap.control_destination_codes(), [0x12, 0x20]);
+        assert_eq!(
+            cmap.decode_cids(&[0, 0x30, 0, 0x31, 0, 0x10]),
+            "~\u{FFFD}\t"
+        );
+    }
+
+    /// A range that sweeps through the control block on its way to
+    /// printable destinations — an identity range, as a text layer's CMap
+    /// writes — makes misses of the members that land on a control, but no
+    /// defects a repair chases: nothing is recovered into them, and the
+    /// repair asks nothing of the program for them. A range whose
+    /// destinations lie in the block, or is the one DEL, is chased.
+    #[test]
+    fn a_range_sweeping_through_the_control_block_is_no_defect_the_repair_chases() {
+        use std::cell::Cell;
+        let mut identity = ToUnicodeCMap {
+            code_byte_length: 2,
+            ..Default::default()
+        };
+        identity.ranges.push((0, 0xFFFF, 0));
+        assert_eq!(identity.lookup_code(5), CodeMapping::ControlDestination);
+        assert_eq!(identity.lookup(9), Some("\t".to_string()));
+        assert_eq!(identity.lookup(0x41), Some("A".to_string()));
+        assert!(identity.control_destination_codes().is_empty());
+        assert!(identity.control_destination_codes().is_empty());
+        let mut program = ToUnicodeCMap::new();
+        program.code_byte_length = 2;
+        program.char_map.insert(5, "x".to_string());
+        let (reading_asked, bytes_asked) = (Cell::new(false), Cell::new(false));
+        repair_control_destinations(
+            &mut identity,
+            Some(&program),
+            || {
+                reading_asked.set(true);
+                None
+            },
+            || {
+                bytes_asked.set(true);
+                None
+            },
+            &lopdf::Dictionary::new(),
+            &Document::new(),
+        );
+        assert_eq!(identity.lookup_code(5), CodeMapping::ControlDestination);
+        assert!(!reading_asked.get() && !bytes_asked.get());
+
+        let mut within = ToUnicodeCMap {
+            code_byte_length: 2,
+            ..Default::default()
+        };
+        within.ranges.push((0x10, 0x13, 0x01)); // U+0001..U+0004
+        within.ranges.push((0x20, 0x22, 0x08)); // BS, TAB, LF
+        within.ranges.push((0x30, 0x30, 0x7F)); // DEL alone
+        within.ranges.push((0x40, 0x41, 0x7E)); // `~` and DEL: a sweep
+        assert_eq!(
+            within.control_destination_codes(),
+            [0x10, 0x11, 0x12, 0x13, 0x20, 0x30]
+        );
+        assert_eq!(within.lookup_code(0x41), CodeMapping::ControlDestination);
+    }
+
+    #[test]
+    fn whitespace_controls_and_nul_padding_read_as_before() {
+        let cmap_content = r#"
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+6 beginbfchar
+<0001> <0009>
+<0002> <000A>
+<0003> <000D>
+<0004> <00000041>
+<0005> <0000>
+<0006> <00000003>
+endbfchar
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+        assert_eq!(cmap.decode_cids(&[0, 1, 0, 2, 0, 3]), "\t\n\r");
+        // NUL padding neither hides a character nor makes a control of one;
+        // a destination of nothing but NUL is a control destination.
+        assert_eq!(cmap.lookup(4), Some("\0A".to_string()));
+        assert_eq!(cmap.lookup_code(5), CodeMapping::ControlDestination);
+        assert_eq!(cmap.lookup_code(6), CodeMapping::ControlDestination);
+        assert_eq!(cmap.control_destination_codes(), [5, 6]);
+    }
+
+    #[test]
+    fn a_single_byte_control_destination_reads_as_the_marker_too() {
+        // The same defect in a simple font's CMap, whose codes are bytes:
+        // the marker, not the byte read as a Latin-1 character.
+        let cmap_content = r#"
+1 begincodespacerange
+<00> <FF>
+endcodespacerange
+4 beginbfchar
+<21> <0063>
+<22> <006F>
+<23> <0003>
+<24> <0065>
+endbfchar
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+        assert_eq!(cmap.code_byte_length, 1);
+        assert_eq!(
+            cmap.decode_cids(&[0x21, 0x22, 0x23, 0x24, 0x24]),
+            "co\u{FFFD}ee"
+        );
+        // Byte by byte, the code is a miss like an unmapped one: the caller
+        // reads it through its other CMaps before marking it.
+        assert_eq!(
+            cmap.lookup_bytes(&[0x23, 0x25]),
+            [(0x23, None), (0x25, None)]
+        );
+    }
+
+    #[test]
+    fn recovery_fills_the_misses_from_another_reading_and_nothing_else() {
+        let mut cmap = ToUnicodeCMap::parse(LIGATURE_INDEX_CMAP.as_bytes()).unwrap();
+        cmap.ranges.push((0x10, 0x11, 0x0B)); // VT and FF: two more misses
+        let mut program = ToUnicodeCMap::new();
+        program.code_byte_length = 2;
+        program.char_map.insert(1, "x".to_string()); // disagrees with the CMap
+        program.char_map.insert(3, "ff".to_string());
+        program.char_map.insert(0x10, "fi".to_string());
+        program.char_map.insert(0x11, "\u{FFFD}".to_string()); // no reading either
+        let codes = cmap.control_destination_codes();
+        cmap.recover_codes(&codes, &program);
+        assert_eq!(
+            cmap.lookup(1),
+            Some("c".to_string()),
+            "a mapped code keeps its text"
+        );
+        assert_eq!(cmap.lookup(3), Some("ff".to_string()));
+        assert_eq!(cmap.lookup(0x10), Some("fi".to_string()));
+        assert_eq!(cmap.lookup_code(0x11), CodeMapping::ControlDestination);
+        assert_eq!(cmap.control_destination_codes(), [0x11]);
+        assert_eq!(cmap.decode_cids(&LIGATURE_INDEX_CODES), "coffee");
+    }
+
+    #[test]
+    fn a_cid_to_gid_map_keeps_a_control_destination_under_its_new_key() {
+        // A CMap keyed by glyph index, re-keyed by CID through a
+        // CIDToGIDMap: the entry stays a miss, not a missing entry.
+        let cmap = ToUnicodeCMap::parse(LIGATURE_INDEX_CMAP.as_bytes()).unwrap();
+        let repaired = build_cmap_with_cid_to_gid_map(&cmap, &[0, 3, 1]).unwrap();
+        assert_eq!(repaired.lookup_code(1), CodeMapping::ControlDestination);
+        assert_eq!(repaired.lookup(2), Some("c".to_string()));
+        assert_eq!(repaired.lookup_code(0), CodeMapping::Unmapped);
+    }
+
+    #[test]
+    fn a_cmap_without_control_destinations_reads_as_before() {
+        let cmap_content = r#"
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+3 beginbfchar
+<0001> <0009>
+<0002> <0020>
+<0003> <00660069>
+endbfchar
+1 beginbfrange
+<0041> <005A> <0041>
+endbfrange
+"#;
+        let cmap = ToUnicodeCMap::parse(cmap_content.as_bytes()).unwrap();
+        assert!(cmap.control_destination_codes().is_empty());
+        assert_eq!(
+            cmap.decode_cids(&[0, 0x41, 0, 1, 0, 0x5A, 0, 2, 0, 3]),
+            "A\tZ fi"
+        );
+    }
+
+    #[test]
+    fn a_string_of_mostly_control_destinations_keeps_its_markers() {
+        // One letter and three control destinations: the markers are the
+        // CMap's own reading of those codes, not a sign that the CMap is
+        // the wrong reading of the string, so the string is not abandoned
+        // — while the coverage still counts the three as unmapped.
+        let cmap = ToUnicodeCMap::parse(
+            b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+              4 beginbfchar\n<0001> <0063>\n<0002> <0002>\n<0003> <0003>\n<0004> <0004>\nendbfchar\n",
+        )
+        .unwrap();
+        let (text, stats) = cmap.decode_cids_with_stats(&[0, 1, 0, 2, 0, 3, 0, 4]);
+        assert_eq!(text, "c\u{FFFD}\u{FFFD}\u{FFFD}");
+        assert_eq!(
+            stats,
+            CidDecodeStats {
+                codes: 4,
+                interpolated: 0,
+                unmapped: 3
+            }
+        );
+        // Codes without any entry still abandon the reading past half.
+        let (text, stats) = cmap.decode_cids_with_stats(&[0, 1, 0, 9, 0, 9, 0, 9]);
+        assert_eq!(text, "");
+        assert_eq!(stats.unmapped, 3);
+    }
+
+    /// The promotion of a fallback with more entries than the ToUnicode
+    /// CMap over a sequential remap is the inline-CMap builder's alone: the
+    /// page-font collection never did it, and passes `promote` false. The
+    /// flag decides it, and the roles the repair follows move with it.
+    #[test]
+    fn the_promotion_over_a_sequential_remap_follows_the_promote_flag() {
+        let cmap_of = |codes: std::ops::Range<u16>| {
+            let mut cmap = ToUnicodeCMap::new();
+            cmap.code_byte_length = 2;
+            for code in codes {
+                cmap.char_map
+                    .insert(code, char::from(b'A' + (code % 26) as u8).to_string());
+            }
+            cmap.refresh_gap_fills();
+            cmap
+        };
+        // Twelve entries keep the ToUnicode CMap primary; the remap has as
+        // many, the fallback twenty.
+        let build = |promote: bool| {
+            cmap_entry(
+                cmap_of(40..52),
+                Some(cmap_of(1..13)),
+                Some(cmap_of(1..21)),
+                12,
+                0,
+                promote,
+            )
+        };
+        let entry = build(false);
+        assert_eq!(entry.primary.char_map.len(), 12);
+        assert_eq!(entry.remapped.as_ref().map(|c| c.char_map.len()), Some(12));
+        assert_eq!(entry.fallback.as_ref().map(|c| c.char_map.len()), Some(20));
+        let entry = build(true);
+        assert_eq!(entry.primary.char_map.len(), 12);
+        assert_eq!(entry.remapped.as_ref().map(|c| c.char_map.len()), Some(20));
+        assert_eq!(entry.fallback.as_ref().map(|c| c.char_map.len()), Some(12));
+    }
+
+    /// The program is decompressed and read for a control destination only
+    /// when the cheaper sources leave the code: a code the `/Differences`
+    /// name is the name's, read font by font at decode time, and stays a
+    /// control destination here without a look at the program — whether
+    /// the name reads as letters or as nothing; one the Differences leave
+    /// alone, and the fallback cannot read, is left to the program.
+    #[test]
+    fn the_program_is_read_only_for_a_code_the_differences_and_the_fallback_leave() {
+        use lopdf::dictionary;
+        use std::cell::Cell;
+        let font_with_differences = |code: i64, name: &[u8]| {
+            dictionary! {
+                "Type" => "Font",
+                "Subtype" => "TrueType",
+                "Encoding" => dictionary! {
+                    "Type" => "Encoding",
+                    "Differences" => vec![code.into(), Object::Name(name.to_vec())],
+                },
+            }
+        };
+        let cmap = || {
+            ToUnicodeCMap::parse(
+                b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+                  4 beginbfchar\n<0001> <0063>\n<0002> <006F>\n<0003> <0003>\n<0004> <0065>\nendbfchar\n",
+            )
+            .unwrap()
+        };
+        let mut program = ToUnicodeCMap::new();
+        program.code_byte_length = 2;
+        program.char_map.insert(3, "x".to_string());
+        // Whether the program's reading, then its bytes, were asked for.
+        let repair = |target: &mut ToUnicodeCMap, font: &lopdf::Dictionary, reads: bool| {
+            let (reading_asked, bytes_asked) = (Cell::new(false), Cell::new(false));
+            repair_control_destinations(
+                target,
+                None,
+                || {
+                    reading_asked.set(true);
+                    reads.then_some(&program)
+                },
+                || {
+                    bytes_asked.set(true);
+                    None
+                },
+                font,
+                &Document::new(),
+            );
+            (reading_asked.get(), bytes_asked.get())
+        };
+        let mut target = cmap();
+        assert_eq!(
+            repair(&mut target, &font_with_differences(3, b"f_f"), true),
+            (false, false)
+        );
+        assert_eq!(target.lookup_code(3), CodeMapping::ControlDestination);
+        let mut target = cmap();
+        assert_eq!(
+            repair(&mut target, &font_with_differences(3, b"f_zzz"), true),
+            (false, false)
+        );
+        assert_eq!(target.lookup_code(3), CodeMapping::ControlDestination);
+        let mut target = cmap();
+        assert_eq!(
+            repair(&mut target, &font_with_differences(5, b"f_f"), true),
+            (true, false)
+        );
+        assert_eq!(target.lookup(3).as_deref(), Some("x"));
+        let mut target = cmap();
+        assert_eq!(
+            repair(&mut target, &font_with_differences(5, b"f_f"), false),
+            (true, true)
+        );
+        assert_eq!(target.lookup_code(3), CodeMapping::ControlDestination);
+    }
+
+    #[test]
+    fn a_repair_reads_the_fallback_first_and_the_program_for_what_it_lacks() {
+        // A rich CMap — twelve entries, so it keeps the primary role — with
+        // two control destinations, at 3 (a ligature) and at 5. The font's
+        // fallback, the reading of its character collection, has code 5
+        // and not code 3; the embedded program names both glyphs. Composed
+        // as the entry builders compose them, the sources read in that
+        // order: the collection's character for 5, the program's ligature
+        // for 3, which the collection could not give.
+        let mut lines = String::from(
+            "<0001> <0063>\n<0002> <006F>\n<0003> <0003>\n<0004> <0065>\n<0005> <0005>\n",
+        );
+        for code in 6..=12u16 {
+            lines.push_str(&format!("<{code:04X}> <{:04X}>\n", 0x60 + code));
+        }
+        let primary = ToUnicodeCMap::parse(
+            format!("1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n12 beginbfchar\n{lines}endbfchar\n")
+                .as_bytes(),
+        )
+        .unwrap();
+        let two_byte = |entries: &[(u16, &str)]| {
+            let mut cmap = ToUnicodeCMap::new();
+            cmap.code_byte_length = 2;
+            for &(code, text) in entries {
+                cmap.char_map.insert(code, text.to_string());
+            }
+            cmap.refresh_gap_fills();
+            cmap
+        };
+        let collection = two_byte(&[(1, " "), (2, "!"), (4, "#"), (5, "$")]);
+        let program = two_byte(&[(3, "ff"), (5, "x")]);
+        let mut primary = primary;
+        repair_control_destinations(
+            &mut primary,
+            Some(&collection),
+            || Some(&program),
+            || None,
+            &lopdf::Dictionary::new(),
+            &Document::new(),
+        );
+        assert_eq!(primary.lookup(3).as_deref(), Some("ff"));
+        assert_eq!(primary.lookup(5).as_deref(), Some("$"));
+        assert_eq!(
+            primary.decode_cids(&[0, 1, 0, 2, 0, 3, 0, 4, 0, 5]),
+            "coffe$"
+        );
+    }
+
+    #[test]
+    fn a_repair_refreshes_the_gaps_the_entries_read() {
+        // A at 36, a control destination at 37, C at 38 and E at 40. The
+        // run 36..38 does not rise while 37 reads as no text, so the gap at
+        // 39 is not read; repaired to B, the run rises and 39 reads as D.
+        let mut cmap = ToUnicodeCMap::parse(
+            b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+              4 beginbfchar\n<0024> <0041>\n<0025> <0003>\n<0026> <0043>\n<0028> <0045>\nendbfchar\n",
+        )
+        .unwrap();
+        assert_eq!(cmap.lookup_code(37), CodeMapping::ControlDestination);
+        assert_eq!(cmap.gap_fill(39), None);
+        let mut program = ToUnicodeCMap::new();
+        program.code_byte_length = 2;
+        program.char_map.insert(37, "B".to_string());
+        program.refresh_gap_fills();
+        repair_control_destinations(
+            &mut cmap,
+            Some(&program),
+            || None,
+            || None,
+            &lopdf::Dictionary::new(),
+            &Document::new(),
+        );
+        assert_eq!(cmap.lookup(37).as_deref(), Some("B"));
+        assert_eq!(cmap.gap_fill(39), Some('D'));
+        assert_eq!(
+            cmap.decode_cids(&[0, 36, 0, 37, 0, 38, 0, 39, 0, 40]),
+            "ABCDE"
+        );
     }
 
     #[test]
@@ -3891,6 +4939,33 @@ endbfrange
         assert!(w_array_covers_cid(&d, &doc, 120));
         assert!(!w_array_covers_cid(&d, &doc, 99));
         assert!(!w_array_covers_cid(&d, &doc, 121));
+    }
+
+    /// A `/W` entry whose width token is not a number still lists its CIDs
+    /// — the remap heuristic reads them as covered, as it always did — but
+    /// gives them no width, so the advance falls through to `/DW`.
+    #[test]
+    fn a_w_entry_whose_width_is_no_number_covers_its_cids_without_a_width() {
+        let doc = Document::new();
+        let mut d = cid_font_dict_with_w(vec![
+            lopdf::Object::Integer(1),
+            lopdf::Object::Integer(5),
+            lopdf::Object::Name(b"Bogus".to_vec()),
+            lopdf::Object::Integer(7),
+            lopdf::Object::Array(vec![
+                lopdf::Object::Name(b"Bogus".to_vec()),
+                lopdf::Object::Integer(400),
+            ]),
+        ]);
+        d.set("DW", lopdf::Object::Integer(750));
+        assert!(w_array_covers_cid(&d, &doc, 3));
+        assert_eq!(w_array_width(&d, &doc, 3), None);
+        assert_eq!(cid_advance(&d, &doc, 3), 750.0);
+        assert!(w_array_covers_cid(&d, &doc, 7));
+        assert_eq!(w_array_width(&d, &doc, 7), None);
+        assert_eq!(w_array_width(&d, &doc, 8), Some(400.0));
+        assert!(!w_array_covers_cid(&d, &doc, 9));
+        assert_eq!(cid_advance(&d, &doc, 9), 750.0);
     }
 
     #[test]
