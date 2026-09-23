@@ -11,8 +11,92 @@ version and date. Earlier releases are described in their
 
 Changes since 1.23.0.
 
+### Added
+
+- `TextItem::fill_color`, `TextItem::stroke_color` and
+  `TextItem::render_mode`: the paint each run was shown with, so a caller can
+  read the colour of a run and tell visible text from invisible text. The
+  colours are the graphics state's non-stroking and stroking colours as 8-bit
+  sRGB `[red, green, blue]`: DeviceRGB read as sRGB, DeviceGray as three
+  equal components, DeviceCMYK converted the way the PDF specification
+  converts it to DeviceRGB (each channel `1 - min(1, ink + black)`), an
+  ICCBased space read as the device space of its component count (1, 3 or 4)
+  without applying the profile, and an Indexed space (`/Indexed`, or its
+  abbreviation `/I`) through its palette's base space, which another colour
+  space resource may name; components outside their range are clamped, and
+  `cs`/`CS` start a space at the initial colour the specification gives it
+  (black, but white for a four-component ICCBased space, whose components
+  all start at 0). A colour is `None`
+  for Separation, DeviceN, Pattern and the CIE-based spaces, after a colour
+  operator whose operands do not fit its space, and for image, link,
+  form-field and OCR items. `render_mode` is the `Tr` mode, `0..=7` — 3
+  (invisible, the mode of OCR text layers) and 7 (clipping only) put no
+  glyphs on the page — and a `Tr` whose operand is not an integer in that
+  range is ignored. The paint is graphics state: it holds across text
+  objects, `q`/`Q` save and restore it, a Form XObject starts with the paint
+  it was invoked under, and an ActualText span reports the paint of its first
+  painted glyph (see below for its weight). Reporting it leaves extraction as
+  it was: no run is dropped
+  or kept on its account, markdown is unchanged, and an item merged from
+  several runs keeps its first run's values. Node `fillColor` and
+  `strokeColor` (`[number, number, number]`) and `renderMode`, Python
+  `fill_color` and `stroke_color` (`tuple[int, int, int]`) and `render_mode`,
+  and the `pdf2md --items-json` fields `fill_color`, `stroke_color` (`[r,g,b]`
+  or `null`) and `render_mode` report the same values.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
+- The document information dictionary's `/Author`, `/Subject`, `/Keywords`,
+  `/Creator`, `/Producer`, `/CreationDate` and `/ModDate`, beside its
+  `/Title`: `PdfProcessResult` and `PdfTypeResult` fields `author`,
+  `subject`, `keywords`, `creator`, `producer`, `creation_date` and
+  `mod_date`, the dates as written (`D:20240115103000+01'00'`), each `None`
+  when the entry is missing or not a string. Node and WebAssembly `author`,
+  `subject`, `keywords`, `creator`, `producer`, `creationDate` and `modDate`,
+  Python attributes named like the Rust fields, and the members `title`
+  through `mod_date` (`null` when absent) of the JSON `pdf2md --json` prints
+  in every mode and `detect-pdf --json` prints with and without `--analyze`
+  report the same values. Every entry, the title included, is decoded as a
+  PDF text string: UTF-16BE after its byte order mark, UTF-8 after its mark
+  (PDF 2.0) and PDFDocEncoding otherwise, with UTF-16LE after `FF FE` and
+  valid UTF-8 written without a mark read as such, and language escapes and
+  trailing NULs dropped. XMP metadata is not read.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
+
+### Changed
+
+- Rust `TextItem` literals must include the new `fill_color`,
+  `stroke_color` and `render_mode` fields (`None` for items that don't come
+  from a content-stream show operator), and `PdfProcessResult` and
+  `PdfTypeResult` literals the new document information fields.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
+
 ### Fixed
 
+- Text a page's content stream shows with the `"` operator (`aw ac string
+  "`: set the word spacing to `aw` and the character spacing to `ac`, move to
+  the next line and show `string`) inside a text object is extracted, as it
+  already was inside Form XObjects; outside a text object the operator is
+  ignored, as `Tj` and `TJ` are there. The page parser skipped the operator
+  altogether, so the string was missing from the output and the spacing and
+  the line move it makes were lost for the text shown after it.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
+- An ActualText span is bold on its paint's account (text filled and
+  stroked to look heavier) when its first painted glyph was painted that
+  way, the paint its colours and render mode are reported from. The paint in
+  force at the span's end decided, so a render mode, line width or colour
+  set after the span's glyphs and before its end made the replacement text
+  bold, or plain, whatever painted the glyphs.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
+- The document's `/Title` is decoded as a PDF text string, like the entries
+  added above. A title in PDFDocEncoding read with U+FFFD in place of its
+  accented letters and of the encoding's typographic punctuation, euro sign
+  and ligatures whenever its bytes were not valid UTF-8, and one in UTF-16LE
+  after `FF FE` read as mojibake; a title given by reference to a string
+  object, or in an information dictionary written in place of a reference,
+  was not read at all. Titles in UTF-16BE or valid UTF-8 read as before,
+  without a UTF-8 byte order mark, language escapes or the NULs some
+  producers pad a string's end with.
+  ([#579](https://github.com/firecrawl/pdf-inspector/pull/579))
+||||||| 7a34011
 - Two lines of small type whose baselines lay less than 5 pt apart — a
   stacked table header at 4.7 pt on a 4.5 pt pitch — fell into one line,
   and shown glyph by glyph, as kerned small type is, their glyphs
@@ -27,6 +111,7 @@ Changes since 1.23.0.
   lines above stay apart. A fragment without a type size, and an image,
   keeps the 5 pt window.
   ([#580](https://github.com/firecrawl/pdf-inspector/pull/580))
+
 
 ## [1.23.0] - 2026-09-21
 
